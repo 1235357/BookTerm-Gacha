@@ -1,0 +1,20 @@
+# 大文件
+resource/kg_ner_bf16/model.safetensors
+
+# 依赖目录
+__pycache__/
+*.pyc
+
+# 输入输出目录
+input/
+output/
+
+# 配置文件
+.env
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
