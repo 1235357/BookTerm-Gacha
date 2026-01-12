@@ -199,6 +199,8 @@ If you encounter errors:
 
 ### Method 2: Clone Repository (For Developers & GPU Users)
 
+Remember to clone https://huggingface.co/neavo/keyword_gacha_multilingual_ner to "\BookTerm Gacha\resource\kg_ner_bf16"
+
 Choose this method if:
 - ✅ You have an NVIDIA GPU and want **faster processing** (3-10x speedup)
 - ✅ The release version **doesn't recognize your GPU**
