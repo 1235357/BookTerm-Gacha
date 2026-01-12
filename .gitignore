@@ -1,5 +1,6 @@
 # 大文件
 resource/kg_ner_bf16/model.safetensors
+resource/kg_ner_bf16_backup/
 
 # 依赖目录
 __pycache__/

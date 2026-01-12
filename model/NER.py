@@ -242,12 +242,13 @@ class NER:
     # 加载模型
     def load_model(self, model_path: str, gpu_boost: bool) -> PreTrainedModel:
         # 根据配置选择使用数据类型
+        # 注意：新版本 transformers 使用 dtype 而非 torch_dtype
         if gpu_boost == False:
-            torch_dtype = torch.float32
+            model_dtype = torch.float32
         elif is_torch_bf16_gpu_available() == True:
-            torch_dtype = torch.bfloat16
+            model_dtype = torch.bfloat16
         else:
-            torch_dtype = torch.float16
+            model_dtype = torch.float16
 
         # 创建配置，并关闭 reference_compile
         config = AutoConfig.from_pretrained(
@@ -261,7 +262,7 @@ class NER:
             model_path,
             config = config,
             attn_implementation = "sdpa",
-            torch_dtype = torch_dtype,
+            dtype = model_dtype,  # 使用 dtype 替代已废弃的 torch_dtype
             local_files_only = True,
         )
 

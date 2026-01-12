@@ -30,11 +30,89 @@ https://github.com/neavo/KeywordGacha
 """
 
 import os
+import sys
 import copy
 import json
 import asyncio
+import subprocess
 from types import SimpleNamespace
 
+# ============== Windows 控制台 UTF-8 编码设置（必须在最开始） ==============
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        # 设置控制台输出代码页为 UTF-8
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except:
+        pass
+    
+    # 设置标准输出编码
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except:
+            pass
+
+
+def run_environment_check() -> bool:
+    """
+    运行环境检查和自动修复
+    
+    Returns:
+        True 如果环境就绪，False 如果失败
+    """
+    try:
+        from module.EnvChecker import check_environment
+        return check_environment(auto_repair=True)
+    except ImportError:
+        # Rich 未安装，先安装基础包
+        print("=" * 60)
+        print("  首次运行，正在初始化环境...")
+        print("=" * 60)
+        
+        mirrors = [
+            "https://pypi.tuna.tsinghua.edu.cn/simple",
+            "https://mirrors.aliyun.com/pypi/simple",
+        ]
+        
+        for mirror in mirrors:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-i", mirror, 
+                     "--trusted-host", mirror.split("//")[1].split("/")[0],
+                     "rich", "loguru"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                if result.returncode == 0:
+                    print(f"  ✓ 基础包安装成功")
+                    break
+            except Exception:
+                continue
+        
+        # 重新尝试
+        try:
+            from module.EnvChecker import check_environment
+            return check_environment(auto_repair=True)
+        except Exception as e:
+            print(f"\n❌ 环境初始化失败: {e}")
+            print("   请手动运行: pip install -r requirements.txt")
+            return False
+
+
+# ============== 环境检查（必须在导入其他模块之前） ==============
+if __name__ == "__main__":
+    if not run_environment_check():
+        print("\n❌ 环境检测失败，请手动安装依赖后重试")
+        print("   参考命令: pip install -r requirements.txt")
+        os.system("pause")
+        sys.exit(1)
+
+
+# ============== 环境检查通过后，导入所有依赖 ==============
 from rich import box
 from rich.table import Table
 from rich.prompt import Prompt
@@ -48,6 +126,7 @@ from module.ProgressHelper import ProgressHelper
 from module.TestHelper import TestHelper
 from module.FileManager import FileManager
 from module.Text.TextHelper import TextHelper
+
 
 # ============== 配置常量（默认值，会被 config.json 覆盖） ==============
 SCORE_THRESHOLD = 0.60          # 置信度阈值
@@ -319,7 +398,7 @@ async def begin(llm: LLM, ner: NER, file_manager: FileManager, config: SimpleNam
 def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
     global SCORE_THRESHOLD, MAX_DISPLAY_LENGTH
     
-    with LogHelper.status("正在初始化 [green]KG[/] 引擎 ..."):
+    with LogHelper.status("正在初始化 [green] BookTerm Gacha [/] 引擎 ..."):
         config = SimpleNamespace()
         version = ""
 
@@ -399,9 +478,7 @@ async def main() -> None:
     except Exception as e:
         LogHelper.error(f"{LogHelper.get_trackback(e)}")
         LogHelper.print()
-        LogHelper.print()
-        LogHelper.error("出现严重错误，程序即将退出，错误信息已保存至日志文件 [green]BookTermGacha.log[/] ...")
-        LogHelper.print()
+        LogHelper.error("出现严重错误，程序即将退出，错误信息已保存至日志文件 ...")
         LogHelper.print()
         os.system("pause")
 

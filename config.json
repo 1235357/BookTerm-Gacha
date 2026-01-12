@@ -1,6 +1,6 @@
 {
     "api_key": [
-        "0d216acbbaea857900f5964e8869375b.LYjkb7VFAGRZKwHa",
+        "",
         "接口密钥，从接口平台方获取，使用在线接口时一定要设置正确。"
     ],
     "base_url": [
@@ -9,7 +9,8 @@
     ],
     "model_name": [
         "glm-4.6v-flash",
-        "模型名称，从接口平台方获取，使用在线接口时一定要设置正确。"
+        "模型名称，从接口平台方获取，使用在线接口时一定要设置正确。",
+        "免费模型：glm-4.6v-flash（免费）, glm-4-flash（免费）"
     ],
     "count_threshold": [
         2,
@@ -23,7 +24,13 @@
         5,
         "网络请求频率阈值，单位为 次/秒，值可以小于 1，如果频繁出现 429 代码的网络错误，可以调小这个值。",
         "使用 llama.cpp 运行的本地模型时，将根据 llama.cpp 的配置调整自动设置，无需手动调整这个值。",
-        "使用 火山引擎 等不限制并发数的在线接口时可以调大这个值。"
+        "使用智谱免费API时建议设为 5 或更低，避免并发限制。"
+    ],
+    "max_concurrent_requests": [
+        5,
+        "最大并发请求数，同时进行的请求数量上限。",
+        "设置较小的值（如 3-5）可以有效避免 429 并发限制错误。",
+        "此值与 request_frequency_threshold 共同控制并发：并发数 = min(max_concurrent_requests, request_frequency_threshold)。"
     ],
     "traditional_chinese_enable": [
         false,
@@ -40,7 +47,7 @@
         "用于过滤异常的超长术语。"
     ],
     "max_context_samples": [
-        5,
+        3,
         "上下文采样数量，从同一词语出现的不同位置采样多少条上下文。",
         "值越大提供的语境越丰富，但会增加 token 消耗。建议 5-15。"
     ],

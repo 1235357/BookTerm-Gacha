@@ -1,36 +1,35 @@
 """
-BookTerm Gacha - LLM Agent Module
-=================================
+BookTerm Gacha - LLM Agent Module (重构版)
+==========================================
 
-This module implements the core LLM (Large Language Model) agent for semantic analysis
-and translation of extracted terms. It handles:
+参照兄弟项目 Dev-Experimental/module/Engine/TaskRequester.py 完全重写。
 
-- API communication with OpenAI-compatible LLM services
-- Surface form analysis (determining term types: character names, locations, etc.)
-- Context translation for better understanding of terms
-- Kana residue detection and handling (Japanese text processing)
-- Retry logic with forced transliteration fallback
-- Rate limiting and concurrent request management
+核心改动：
+1. 多平台检测和优化（智谱、阿里云百炼 DeepSeek、OpenAI O系列等）
+2. 【强制启用深度思考模式】- 不区分专家模式
+3. 智能请求头构建（User-Agent、extra_body 等）
+4. 流式输出 + 深度思考的完整支持
+5. 完整的日志输出（打开黑盒子）
 
-Key Classes:
-    LLM: Main agent class that orchestrates all LLM-related operations
+支持的平台：
+    - 智谱 API (bigmodel.cn) - 深度思考 + 流式输出
+    - 阿里云百炼 DeepSeek (api-inference.modelscope.cn) - 流式输出
+    - OpenAI O系列 (o1, o3-mini, o4-mini) - max_completion_tokens
+    - QWEN3 - /no_think 控制
+    - 标准 OpenAI 兼容 API
 
-Dependencies:
-    - openai: Async OpenAI client for API communication
-    - pykakasi: Japanese text romanization
-    - aiolimiter: Async rate limiting
-    - rich: Progress bar display
-
-Based on KeywordGacha v0.13.1 by neavo
-https://github.com/neavo/KeywordGacha
+Based on LinguaGacha's TaskRequester.py
 """
 
 import re
 import asyncio
 import threading
 import urllib.request
+from functools import lru_cache
 from types import SimpleNamespace
+from typing import Optional
 
+import httpx
 import pykakasi
 import json_repair as repair
 from openai import AsyncOpenAI
@@ -42,44 +41,69 @@ from model.NER import NER
 from model.Word import Word
 from module.Text.TextHelper import TextHelper
 from module.LogHelper import LogHelper
+from module.LogTable import LogTable
+from module.TaskTracker import TaskTracker, get_current_tracker, set_current_tracker
+
 
 class LLM:
+    """
+    LLM Agent 模块 - BookTerm Gacha 的核心 AI 组件
+    
+    参照 Dev-Experimental/TaskRequester.py 重构
+    """
 
-    # 任务类型
+    # ==================== 平台检测正则（借鉴 TaskRequester.py） ====================
+    
+    # 智谱 API 检测
+    RE_ZHIPU: re.Pattern = re.compile(r"bigmodel\.cn|zhipu", flags=re.IGNORECASE)
+    
+    # 阿里云百炼 DeepSeek 模型检测
+    RE_DASHSCOPE_DEEPSEEK_URL: re.Pattern = re.compile(r"api-inference\.modelscope\.cn", flags=re.IGNORECASE)
+    RE_DASHSCOPE_DEEPSEEK_MODEL: re.Pattern = re.compile(r"deepseek-ai", flags=re.IGNORECASE)
+    
+    # OpenAI O系列模型 (o1, o3-mini, o4-mini-20240406 等)
+    RE_O_SERIES: re.Pattern = re.compile(r"o\d$|o\d-", flags=re.IGNORECASE)
+    
+    # QWEN3 系列
+    RE_QWEN3: re.Pattern = re.compile(r"qwen3", flags=re.IGNORECASE)
+    
+    # Gemini 2.5 Flash
+    RE_GEMINI_2_5_FLASH: re.Pattern = re.compile(r"gemini-2\.5-flash", flags=re.IGNORECASE)
+    
+    # 多行压缩
+    RE_LINE_BREAK: re.Pattern = re.compile(r"\n+")
+
+    # ==================== 任务类型 ====================
+
     class Type(BaseData):
-
-        API_TEST: int = 100                  # 语义分析
+        API_TEST: int = 100                  # 接口测试
         SURFACE_ANALYSIS: int = 200          # 语义分析
         TRANSLATE_CONTEXT: int = 300         # 翻译参考文本
 
-    # LLM 配置参数
-    class LLMConfig(BaseData):
+    # ==================== LLM 配置参数 ====================
 
+    class LLMConfig(BaseData):
         TEMPERATURE: float = 0.05
         TOP_P: float = 0.95
         MAX_TOKENS: float = 1024
         FREQUENCY_PENALTY: float = 0.0
 
-    # 最大重试次数（减少到 8 次，超过后使用强制音译兜底）
+    # 最大重试次数
     MAX_RETRY: int = 16
     
-    # 强制音译阈值（超过此重试次数后，对问题词条直接使用强制音译）
+    # 强制音译阈值
     FORCE_TRANSLITERATE_THRESHOLD: int = 16
 
-    # 类型映射表 - 只保留 "角色" 和 "地点" 两种类型
+    # 类型映射表
     GROUP_MAPPING = {
         "角色" : ["姓氏", "名字"],
         "地点" : ["地点", "建筑", "设施"],
     }
     GROUP_MAPPING_BANNED = {
         "黑名单" : [
-            # 一般性排除
             "行为", "活动", "其他", "无法判断",
-            # 组织/群体类
             "组织", "群体", "家族", "种族", "团体", "部门", "公司", "学校", "部活", "社团",
-            # 物品类
             "物品", "食品", "工具", "道具", "食物", "饮品", "饮料", "衣物", "服装", "家具", "电器", "器具",
-            # 生物类（非人类角色）
             "生物", "植物", "动物", "怪物", "魔物", "妖怪", "精灵", "魔兽",
         ],
     }
@@ -88,19 +112,131 @@ class LLM:
         "地点" : [],
     }
 
+    # ==================== 初始化 ====================
+
     def __init__(self, config: SimpleNamespace) -> None:
         self.api_key = config.api_key
         self.base_url = config.base_url
         self.model_name = config.model_name
         self.request_timeout = config.request_timeout
         self.request_frequency_threshold = config.request_frequency_threshold
+        # 最大并发请求数（用于控制并发上限，解决 429 问题）
+        self.max_concurrent_requests = getattr(config, 'max_concurrent_requests', 5)
 
-        # 初始化
+        # 初始化工具
         self.kakasi = pykakasi.kakasi()
-        self.client = self.load_client()
+        self.client = self._create_client()
+        self.stream_client = self._create_client_no_timeout()
 
         # 线程锁
         self.lock = threading.Lock()
+        
+        # 平台检测缓存
+        self._platform_info: Optional[dict] = None
+
+    # ==================== 客户端创建（借鉴 TaskRequester.py） ====================
+
+    def _create_client(self) -> AsyncOpenAI:
+        """
+        创建标准 OpenAI 客户端
+        
+        超时设置参照 TaskRequester.py:
+        - connect: 8秒 (TCP 连接)
+        - read: request_timeout (等待响应)
+        - write: 8秒 (发送请求)
+        - pool: 8秒 (连接池)
+        """
+        return AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=httpx.Timeout(
+                read=self.request_timeout,
+                pool=8.0,
+                write=8.0,
+                connect=8.0,
+            ),
+            max_retries=1,
+        )
+    
+    def _create_client_no_timeout(self) -> AsyncOpenAI:
+        """
+        创建无超时客户端（用于深度思考流式输出）
+        
+        智谱深度思考、阿里云百炼 DeepSeek 等需要长时间思考的场景
+        """
+        return AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=httpx.Timeout(None),  # 完全禁用超时
+            max_retries=1,
+        )
+
+    # ==================== 平台检测（借鉴 TaskRequester.py） ====================
+
+    def _detect_platform(self) -> dict:
+        """
+        检测当前 API 平台类型
+        
+        返回 dict 包含：
+        - platform: 平台名称
+        - is_zhipu: 是否智谱
+        - is_dashscope_deepseek: 是否阿里云百炼 DeepSeek
+        - is_o_series: 是否 OpenAI O系列
+        - is_qwen3: 是否 QWEN3
+        - thinking_enabled: 是否启用深度思考
+        - stream_required: 是否需要流式输出
+        """
+        if self._platform_info is not None:
+            return self._platform_info
+        
+        info = {
+            "platform": "openai_compatible",
+            "is_zhipu": False,
+            "is_dashscope_deepseek": False,
+            "is_o_series": False,
+            "is_qwen3": False,
+            "is_gemini": False,
+            "thinking_enabled": True,  # 【强制启用深度思考】
+            "stream_required": False,
+        }
+        
+        # 智谱 API 检测
+        if self.RE_ZHIPU.search(self.base_url):
+            info["platform"] = "zhipu"
+            info["is_zhipu"] = True
+            info["stream_required"] = True  # 智谱深度思考必须用流式
+            LogHelper.info(f"[平台检测] 检测到 [bold green]智谱 API[/] - 启用深度思考 + 流式输出")
+        
+        # 阿里云百炼 DeepSeek 检测
+        elif self.RE_DASHSCOPE_DEEPSEEK_URL.search(self.base_url) and self.RE_DASHSCOPE_DEEPSEEK_MODEL.search(self.model_name):
+            info["platform"] = "dashscope_deepseek"
+            info["is_dashscope_deepseek"] = True
+            info["stream_required"] = True  # DeepSeek 深度思考必须用流式
+            LogHelper.info(f"[平台检测] 检测到 [bold green]阿里云百炼 DeepSeek[/] - 启用深度思考 + 流式输出")
+        
+        # OpenAI O系列检测
+        elif self.RE_O_SERIES.search(self.model_name):
+            info["platform"] = "openai_o_series"
+            info["is_o_series"] = True
+            LogHelper.info(f"[平台检测] 检测到 [bold green]OpenAI O系列模型[/] - 使用 max_completion_tokens")
+        
+        # QWEN3 检测
+        elif self.RE_QWEN3.search(self.model_name):
+            info["platform"] = "qwen3"
+            info["is_qwen3"] = True
+            LogHelper.info(f"[平台检测] 检测到 [bold green]QWEN3 模型[/] - 思考模式自动控制")
+        
+        # Gemini 检测
+        elif self.RE_GEMINI_2_5_FLASH.search(self.model_name):
+            info["platform"] = "gemini"
+            info["is_gemini"] = True
+            LogHelper.info(f"[平台检测] 检测到 [bold green]Gemini 2.5 Flash[/]")
+        
+        else:
+            LogHelper.info(f"[平台检测] 使用 [bold]标准 OpenAI 兼容 API[/]")
+        
+        self._platform_info = info
+        return info
 
     # ============== 精确字符检测（借鉴 Dev-Experimental/TextBase） ==============
     
@@ -208,14 +344,15 @@ class LLM:
         intersection = len(set_src & set_dst)
         return intersection / union if union > 0 else 0.0
 
-    # 初始化 OpenAI 客户端
+    # ==================== 客户端方法（向后兼容） ====================
+
     def load_client(self) -> AsyncOpenAI:
-        return AsyncOpenAI(
-            timeout = self.request_timeout,
-            api_key = self.api_key,
-            base_url = self.base_url,
-            max_retries = 0
-        )
+        """向后兼容：返回标准客户端"""
+        return self._create_client()
+    
+    def load_stream_client(self) -> AsyncOpenAI:
+        """向后兼容：返回无超时客户端"""
+        return self._create_client_no_timeout()
 
     # 设置语言
     def set_language(self, language: int) -> None:
@@ -297,56 +434,263 @@ class LLM:
             LLM.CONTEXT_TRANSLATE_CONFIG.MAX_TOKENS = 16 * 1024
 
         # 设置请求限制器
+        # 并发数 = min(max_concurrent_requests, request_frequency_threshold)
+        # max_concurrent_requests 控制同时进行的请求数上限
+        # request_frequency_threshold 控制每秒的请求频率
+        concurrent_limit = min(self.max_concurrent_requests, max(1, int(self.request_frequency_threshold)))
+        LogHelper.info(f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {self.request_frequency_threshold} 次/秒")
+        
         if self.request_frequency_threshold > 1:
-            self.semaphore = asyncio.Semaphore(self.request_frequency_threshold)
+            self.semaphore = asyncio.Semaphore(concurrent_limit)
             self.async_limiter = AsyncLimiter(max_rate = self.request_frequency_threshold, time_period = 1)
         elif self.request_frequency_threshold > 0:
-            self.semaphore = asyncio.Semaphore(1)
+            self.semaphore = asyncio.Semaphore(concurrent_limit)
             self.async_limiter = AsyncLimiter(max_rate = 1, time_period = 1 / self.request_frequency_threshold)
         else:
             self.semaphore = asyncio.Semaphore(1)
             self.async_limiter = AsyncLimiter(max_rate = 1, time_period = 1)
 
-    # 异步发送请求到 OpenAI 获取模型回复
-    async def do_request(self, messages: list, llm_config: LLMConfig, retry: bool) -> tuple[Exception, dict, str, str, dict, dict]:
+    # ==================== 核心请求方法（完全重写，参照 TaskRequester.py） ====================
+
+    async def do_request(self, messages: list, llm_config: LLMConfig, retry: bool, enable_thinking: bool = True, task_id: str = "") -> tuple[Exception, dict, str, str, dict, dict]:
+        """
+        发送 LLM 请求（完全重写，参照 TaskRequester.py）
+        
+        【强制启用深度思考模式】- 不区分专家模式
+        
+        支持平台：
+        - 智谱 API: 深度思考 + 流式输出
+        - 阿里云百炼 DeepSeek: 流式输出 + enable_thinking
+        - OpenAI O系列: max_completion_tokens
+        - QWEN3: /no_think 控制
+        - 标准 OpenAI 兼容 API
+        
+        Args:
+            messages: 消息列表
+            llm_config: LLM 配置
+            retry: 是否为重试请求
+            enable_thinking: 是否启用深度思考（默认 True，强制启用）
+            task_id: 任务标识（用于 TaskTracker 更新）
+            
+        Returns:
+            (error, usage, response_think, response_result, llm_request, llm_response)
+        """
+        import time as time_module
+        start_time = time_module.time()
+        
+        error = None
+        usage = None
+        response_think = ""
+        response_result = ""
+        llm_request = None
+        llm_response = None
+        
+        # 更新 tracker 状态为 sending
+        tracker = get_current_tracker()
+        if tracker and task_id:
+            tracker.start_task(task_id)
+        
         try:
-            error, usage, response_think, response_result, llm_request, llm_response = None, None, None, None, None, None
-
-            llm_request = {
-                "model" : self.model_name,
-                "stream" : False,
-                "temperature" : max(llm_config.TEMPERATURE, 0.50) if retry == True else llm_config.TEMPERATURE,
-                "top_p" : llm_config.TOP_P,
-                "max_tokens" : llm_config.MAX_TOKENS,
-                # 同时设置 max_tokens 和 max_completion_tokens 时 OpenAI 接口会报错
-                # "max_completion_tokens" : llm_config.MAX_TOKENS,
-                "frequency_penalty" : max(llm_config.FREQUENCY_PENALTY, 0.2) if retry == True else llm_config.FREQUENCY_PENALTY,
-                "messages" : messages,
-            }
-
-            response = await self.client.chat.completions.create(**llm_request)
-
-            # OpenAI 的 API 返回的对象通常是 OpenAIObject 类型
-            # 该类有一个内置方法可以将其转换为字典
-            llm_response = response.to_dict()
-
-            # 提取回复内容
-            usage = response.usage
-            message = response.choices[0].message
-            if hasattr(message, "reasoning_content") and isinstance(message.reasoning_content, str):
-                response_think = message.reasoning_content.replace("\n\n", "\n").strip()
-                response_result = message.content.strip()
-            elif "</think>" in message.content:
-                splited = message.content.split("</think>")
-                response_think = splited[0].removeprefix("<think>").replace("\n\n", "\n").strip()
-                response_result = splited[-1].strip()
+            # 检测平台
+            platform_info = self._detect_platform()
+            
+            # 构建基础请求参数
+            llm_request = self._build_request_args(messages, llm_config, retry, platform_info)
+            
+            # 【已移除】API 请求详情打印（只保留最终结果，避免刷屏）
+            # 如需调试，可取消下方注释：
+            # LogTable.print_api_request(
+            #     model=self.model_name,
+            #     base_url=self.base_url,
+            #     messages=messages,
+            #     thinking_enabled=platform_info.get("thinking_enabled", True),
+            #     stream_enabled=platform_info.get("stream_required", False),
+            # )
+            
+            # 根据平台分发请求
+            if platform_info.get("stream_required"):
+                # 流式请求（智谱、阿里云百炼 DeepSeek）
+                response_think, response_result, input_tokens, output_tokens = await self._do_stream_request(llm_request, task_id)
+                
+                # 构造 usage 代理对象
+                class UsageProxy:
+                    def __init__(self, pt, ct):
+                        self.prompt_tokens = pt
+                        self.completion_tokens = ct
+                
+                usage = UsageProxy(input_tokens, output_tokens)
+                llm_response = {"stream": True, "thinking": response_think[:200] if response_think else ""}
             else:
-                response_think = ""
-                response_result = message.content.strip()
+                # 标准请求
+                response = await self.client.chat.completions.create(**llm_request)
+                llm_response = response.to_dict() if hasattr(response, "to_dict") else {"raw": str(response)}
+                
+                # 提取回复内容
+                usage = response.usage
+                message = response.choices[0].message
+                
+                # 尝试从多种格式中提取思考内容（借鉴 TaskRequester.py）
+                if hasattr(message, "reasoning_content") and isinstance(message.reasoning_content, str):
+                    response_think = self.RE_LINE_BREAK.sub("\n", message.reasoning_content.strip())
+                    response_result = message.content.strip()
+                elif "</think>" in message.content:
+                    splited = message.content.split("</think>")
+                    response_think = self.RE_LINE_BREAK.sub("\n", splited[0].removeprefix("<think>").strip())
+                    response_result = splited[-1].strip()
+                else:
+                    response_think = ""
+                    response_result = message.content.strip()
+                
+                input_tokens = usage.prompt_tokens if usage else 0
+                output_tokens = usage.completion_tokens if usage else 0
+            
+            # 【已移除】API 响应详情打印（只保留最终任务结果表格，避免刷屏）
+            # 如需调试，可取消下方注释：
+            # LogTable.print_api_response(
+            #     response_content=response_result,
+            #     response_think=response_think,
+            #     input_tokens=input_tokens if 'input_tokens' in dir() else (usage.prompt_tokens if usage else 0),
+            #     output_tokens=output_tokens if 'output_tokens' in dir() else (usage.completion_tokens if usage else 0),
+            #     elapsed_time=time_module.time() - start_time,
+            # )
+            
         except Exception as e:
             error = e
-        finally:
-            return error, usage, response_think, response_result, llm_request, llm_response
+            LogHelper.error(f"[LLM请求] 失败: {e}")
+        
+        return error, usage, response_think, response_result, llm_request, llm_response
+
+    def _build_request_args(self, messages: list, llm_config: LLMConfig, retry: bool, platform_info: dict) -> dict:
+        """
+        构建请求参数（参照 TaskRequester.py 的 generate_openai_args）
+        
+        根据不同平台进行优化
+        """
+        # 基础参数
+        args = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": max(llm_config.TEMPERATURE, 0.50) if retry else llm_config.TEMPERATURE,
+            "top_p": llm_config.TOP_P,
+            "max_tokens": max(4 * 1024, int(llm_config.MAX_TOKENS)),
+            "frequency_penalty": max(llm_config.FREQUENCY_PENALTY, 0.2) if retry else llm_config.FREQUENCY_PENALTY,
+            "extra_headers": {
+                "User-Agent": "BookTermGacha/0.1.0 (https://github.com/neavo/KeywordGacha)"
+            }
+        }
+        
+        # ========== 智谱 API 优化 ==========
+        if platform_info.get("is_zhipu"):
+            args["stream"] = True
+            args["stream_options"] = {"include_usage": True}
+            args["extra_body"] = {
+                "thinking": {"type": "enabled"}  # 【强制启用深度思考】
+            }
+        
+        # ========== 阿里云百炼 DeepSeek 优化 ==========
+        elif platform_info.get("is_dashscope_deepseek"):
+            args["stream"] = True
+            args["stream_options"] = {"include_usage": True}
+            args["extra_body"] = {"enable_thinking": True}  # 强制启用思考模式
+        
+        # ========== OpenAI O系列优化 ==========
+        elif platform_info.get("is_o_series"):
+            # O系列不支持 max_tokens，使用 max_completion_tokens
+            args.pop("max_tokens", None)
+            args["max_completion_tokens"] = max(4 * 1024, int(llm_config.MAX_TOKENS))
+        
+        # ========== QWEN3 优化 ==========
+        elif platform_info.get("is_qwen3"):
+            # QWEN3 思考模式通过 /no_think 控制
+            # 如果不需要思考，在消息末尾添加 /no_think
+            pass  # 默认启用思考，不添加 /no_think
+        
+        return args
+
+    async def _do_stream_request(self, llm_request: dict, task_id: str = "") -> tuple[str, str, int, int]:
+        """
+        执行流式请求（用于深度思考模式）
+        
+        参照 TaskRequester.py 的 request_dashscope_deepseek_streaming
+        【无刷屏版】- 更新全局 TaskTracker 而不是创建单独的 Live
+        
+        Args:
+            llm_request: 请求参数
+            task_id: 任务标识（用于更新 tracker）
+        """
+        import time
+        start_time = time.time()
+        
+        response_think = ""
+        response_result = ""
+        input_tokens = 0
+        output_tokens = 0
+        chunk_count = 0
+        is_thinking = True
+        
+        # 获取全局 tracker
+        tracker = get_current_tracker()
+        
+        try:
+            # 使用无超时客户端
+            stream = await self.stream_client.chat.completions.create(**llm_request)
+            
+            async for chunk in stream:
+                chunk_count += 1
+                
+                # 检查是否有 choices
+                if not chunk.choices:
+                    # 最后一个 chunk 包含 usage 信息
+                    if hasattr(chunk, "usage") and chunk.usage is not None:
+                        try:
+                            input_tokens = int(chunk.usage.prompt_tokens)
+                        except:
+                            pass
+                        try:
+                            output_tokens = int(chunk.usage.completion_tokens)
+                        except:
+                            pass
+                    continue
+                
+                delta = chunk.choices[0].delta
+                
+                # 收集思考内容 (reasoning_content)
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+                    response_think += delta.reasoning_content
+                    # 更新全局 tracker
+                    if tracker and task_id:
+                        tracker.update_task(
+                            task_id=task_id,
+                            status="thinking",
+                            think_chars=len(response_think),
+                            reply_chars=len(response_result),
+                            chunks=chunk_count,
+                        )
+                
+                # 收集回复内容 (content)
+                if hasattr(delta, "content") and delta.content is not None:
+                    if is_thinking:
+                        is_thinking = False
+                    response_result += delta.content
+                    # 更新全局 tracker
+                    if tracker and task_id:
+                        tracker.update_task(
+                            task_id=task_id,
+                            status="receiving",
+                            think_chars=len(response_think),
+                            reply_chars=len(response_result),
+                            chunks=chunk_count,
+                        )
+            
+            # 清理格式
+            response_think = self.RE_LINE_BREAK.sub("\n", response_think.strip())
+            response_result = response_result.strip()
+            
+        except Exception as e:
+            LogHelper.error(f"[流式请求] 失败: {e}")
+            raise
+        
+        return response_think, response_result, input_tokens, output_tokens
 
     # 接口测试任务
     async def api_test(self) -> bool:
@@ -397,7 +741,10 @@ class LLM:
                 LogHelper.warning(f"llm_response - {llm_response}")
 
     # 词义分析任务（支持使用已翻译的参考文本）
-    async def surface_analysis(self, word: Word, words: list[Word], fake_name_mapping: dict[str, str], success: list[Word], retry: bool, last_round: bool) -> None:
+    async def surface_analysis(self, word: Word, words: list[Word], fake_name_mapping: dict[str, str], success: list[Word], retry: bool, last_round: bool, task_id: str = "") -> None:
+        import time as time_module
+        start_time = time_module.time()
+        
         async with self.semaphore, self.async_limiter:
             try:
                 if not hasattr(self, "prompt_groups"):
@@ -435,7 +782,7 @@ class LLM:
                         + "\n" + f"参考文本原文：\n{context_original}"
                     )
 
-                error, usage, _, response_result, llm_request, llm_response = await self.do_request(
+                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
                     [
                         {
                             "role": "system",
@@ -447,7 +794,8 @@ class LLM:
                         },
                     ],
                     LLM.SURFACE_ANALYSIS_CONFIG,
-                    retry
+                    retry,
+                    task_id=task_id,
                 )
 
                 # 检查错误
@@ -514,7 +862,6 @@ class LLM:
                         break
                 for k, v in LLM.GROUP_MAPPING_ADDITIONAL.items():
                     if word.group in set(v):
-                        LogHelper.debug(f"[词义分析] 命中额外类型 - {word.surface} [green]->[/] {word.group} ...")
                         word.group = k
                         matched = True
                         break
@@ -524,99 +871,189 @@ class LLM:
                     # 检查是否属于黑名单类型（食品、物品、动物等）- 直接过滤掉，不重试
                     banned_types = set(v for vals in LLM.GROUP_MAPPING_BANNED.values() for v in vals)
                     if word.group in banned_types:
-                        LogHelper.debug(f"[词义分析] 过滤非目标实体 - {word.surface} [green]->[/] {word.group} ...")
                         word.group = ""  # 设为空，后续会被过滤掉
+                        # 打印详细日志：过滤非目标实体
+                        LogTable.print_llm_task(
+                            task_name="词义分析",
+                            word_surface=word.surface,
+                            status="info",
+                            message=f"过滤非目标实体类型: {result.get('group', '')}",
+                            input_tokens=usage.prompt_tokens if usage else 0,
+                            output_tokens=usage.completion_tokens if usage else 0,
+                            elapsed_time=time_module.time() - start_time,
+                            extra_info={"原始分类": result.get("group", ""), "判定": "黑名单类型"},
+                        )
                     elif last_round == True:
-                        LogHelper.warning(f"[词义分析] 无法匹配的实体类型 - {word.surface} [green]->[/] {word.group} ...")
                         word.group = ""
+                        LogTable.print_llm_task(
+                            task_name="词义分析",
+                            word_surface=word.surface,
+                            status="warning",
+                            message=f"无法匹配的实体类型: {result.get('group', '')}（最后一轮）",
+                            response_content=response_result,
+                            input_tokens=usage.prompt_tokens if usage else 0,
+                            output_tokens=usage.completion_tokens if usage else 0,
+                            elapsed_time=time_module.time() - start_time,
+                        )
                     else:
-                        LogHelper.warning(f"[词义分析] 无法匹配的实体类型 - {word.surface} [green]->[/] {word.group} ...")
                         error = Exception("无法匹配的实体类型 ...")
+                        LogTable.print_llm_task(
+                            task_name="词义分析",
+                            word_surface=word.surface,
+                            status="warning",
+                            message=f"无法匹配的实体类型: {result.get('group', '')}，将重试",
+                            response_content=response_result,
+                            input_tokens=usage.prompt_tokens if usage else 0,
+                            output_tokens=usage.completion_tokens if usage else 0,
+                            elapsed_time=time_module.time() - start_time,
+                        )
+                else:
+                    # 成功：打印详细日志
+                    LogTable.print_llm_task(
+                        task_name="词义分析",
+                        word_surface=word.surface,
+                        status="success",
+                        message=f"{word.surface} → {word.surface_translation} [{word.group}]",
+                        request_content=user_content,
+                        response_content=response_result,
+                        response_think=response_think,
+                        input_tokens=usage.prompt_tokens if usage else 0,
+                        output_tokens=usage.completion_tokens if usage else 0,
+                        elapsed_time=time_module.time() - start_time,
+                        extra_info={
+                            "译名": word.surface_translation,
+                            "类型": word.group,
+                            "性别": word.gender,
+                            "摘要": word.context_summary[:50] + "..." if len(word.context_summary) > 50 else word.context_summary,
+                        },
+                    )
             except Exception as e:
-                LogHelper.debug(f"[词义分析] 子任务执行失败: {word.surface} - {e}")
-                LogHelper.debug(f"llm_request - {llm_request}")
-                LogHelper.debug(f"llm_response - {llm_response}")
+                # 失败：打印详细错误日志
+                LogTable.print_llm_task(
+                    task_name="词义分析",
+                    word_surface=word.surface,
+                    status="error",
+                    message=f"任务失败: {str(e)}",
+                    request_content=user_content if 'user_content' in dir() else None,
+                    response_content=response_result if 'response_result' in dir() else None,
+                    input_tokens=usage.prompt_tokens if usage and 'usage' in dir() else 0,
+                    output_tokens=usage.completion_tokens if usage and 'usage' in dir() else 0,
+                    elapsed_time=time_module.time() - start_time,
+                )
                 error = e
             finally:
+                # 更新全局 tracker 状态
+                tracker = get_current_tracker()
+                if tracker and task_id:
+                    tracker.complete_task(task_id, success=(error is None), error=str(error) if error else None)
+                
                 if error == None:
                     with self.lock:
                         success.append(word)
 
     # 批量执行词义分析任务
     async def surface_analysis_batch(self, words: list[Word], fake_name_mapping: dict[str, str]) -> list[Word]:
+        import time as time_module
+        batch_start_time = time_module.time()
+        
         failure: list[Word] = []
         success: list[Word] = []
         
         # 记录每个词条的重试次数
         retry_counts: dict[str, int] = {}
 
+        # 打印阶段标题
+        LogTable.print_stage_header("词义分析", stage_num=2)
+        LogHelper.info(f"待处理词条数: {len(words)}")
         LogHelper.print("")
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("/"),
-            TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task("[cyan]词义分析", total=len(words))
-            
-            for i in range(LLM.MAX_RETRY + 1):
-                if i == 0:
-                    retry = False
-                    words_this_round = words
-                elif len(failure) > 0:
-                    retry = True
-                    words_this_round = failure
-                    
-                    # 达到强制音译阈值的词条，直接使用强制音译，不再重试
-                    still_retry = []
-                    for word in words_this_round:
-                        key = f"{word.surface}|{word.group}"
-                        retry_counts[key] = retry_counts.get(key, 0) + 1
-                        
-                        if retry_counts[key] >= LLM.FORCE_TRANSLITERATE_THRESHOLD:
-                            # 直接使用强制音译
-                            if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
-                                LogHelper.warning(f"[词义分析] 重试{retry_counts[key]}次仍失败，触发强制音译 - {word.surface}")
-                                word.surface_translation = self.force_transliterate(word.surface)
-                            with self.lock:
-                                success.append(word)
-                            progress.update(task, completed=len(success))
-                        else:
-                            still_retry.append(word)
-                    
-                    words_this_round = still_retry
-                    if not words_this_round:
-                        break
-                    
-                    progress.update(task, description=f"[yellow]词义分析 (重试 {i}/{LLM.MAX_RETRY})")
-                else:
-                    break
-
-                # 执行异步任务
-                async def run_with_progress(word: Word):
-                    await self.surface_analysis(word, words, fake_name_mapping, success, retry, i == LLM.MAX_RETRY)
-                    progress.update(task, completed=len(success))
-                
-                tasks = [asyncio.create_task(run_with_progress(word)) for word in words_this_round]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                # 获得失败任务的列表
-                success_pairs = {(word.surface, word.group) for word in success}
-                failure = [word for word in words if (word.surface, word.group) not in success_pairs]
         
-        LogHelper.print("")
+        # 使用 TaskTracker 替代 Progress，实现常驻底部面板
+        with TaskTracker(total=len(words), task_name="词义分析", max_concurrent=self.max_concurrent_requests) as tracker:
+            # 设置全局 tracker，供流式请求更新
+            set_current_tracker(tracker)
+            
+            try:
+                for i in range(LLM.MAX_RETRY + 1):
+                    if i == 0:
+                        retry = False
+                        words_this_round = words
+                    elif len(failure) > 0:
+                        retry = True
+                        words_this_round = failure
+                        
+                        # 更新 tracker 重试计数
+                        tracker.add_retry()
+                        
+                        # 达到强制音译阈值的词条，直接使用强制音译，不再重试
+                        still_retry = []
+                        for word in words_this_round:
+                            key = f"{word.surface}|{word.group}"
+                            retry_counts[key] = retry_counts.get(key, 0) + 1
+                            
+                            if retry_counts[key] >= LLM.FORCE_TRANSLITERATE_THRESHOLD:
+                                # 直接使用强制音译
+                                if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
+                                    LogTable.print_retry_info(
+                                        word_surface=word.surface,
+                                        retry_count=retry_counts[key],
+                                        max_retry=LLM.FORCE_TRANSLITERATE_THRESHOLD,
+                                        reason="触发强制音译",
+                                    )
+                                    word.surface_translation = self.force_transliterate(word.surface)
+                                with self.lock:
+                                    success.append(word)
+                                # 更新 tracker 完成数
+                                tracker.complete_task(f"force_{word.surface}", success=True)
+                            else:
+                                still_retry.append(word)
+                        
+                        words_this_round = still_retry
+                        if not words_this_round:
+                            break
+                        
+                        tracker.set_description(f"[yellow]词义分析 (重试 {i}/{LLM.MAX_RETRY})")
+                    else:
+                        break
 
+                    # 执行异步任务，传递 task_id 给每个任务
+                    async def run_with_tracker(word: Word, task_idx: int):
+                        task_id = f"sa_{task_idx}_{word.surface}"
+                        await self.surface_analysis(word, words, fake_name_mapping, success, retry, i == LLM.MAX_RETRY, task_id=task_id)
+                    
+                    tasks = [asyncio.create_task(run_with_tracker(word, idx)) for idx, word in enumerate(words_this_round)]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # 获得失败任务的列表
+                    success_pairs = {(word.surface, word.group) for word in success}
+                    failure = [word for word in words if (word.surface, word.group) not in success_pairs]
+            finally:
+                # 清除全局 tracker
+                set_current_tracker(None)
+        
         # 【最终强制音译兜底】对于最终仍失败的词条，如果其 surface_translation 仍包含有效假名，强制音译
-        # 使用 contains_kana_strict 允许孤立的拟声词字符
+        forced_count = 0
         for word in words:
             if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
-                LogHelper.warning(f"[词义分析] 触发强制音译兜底 - {word.surface} 原译名: {word.surface_translation}")
+                LogTable.print_llm_task(
+                    task_name="强制音译兜底",
+                    word_surface=word.surface,
+                    status="warning",
+                    message=f"{word.surface_translation} → {self.force_transliterate(word.surface)}",
+                )
                 word.surface_translation = self.force_transliterate(word.surface)
-                LogHelper.info(f"[词义分析] 强制音译结果 - {word.surface} → {word.surface_translation}")
+                forced_count += 1
+
+        # 打印批量汇总
+        LogTable.print_batch_summary(
+            task_name="词义分析",
+            total=len(words),
+            success=len(success),
+            failed=len(failure),
+            elapsed_time=time_module.time() - batch_start_time,
+        )
+        
+        if forced_count > 0:
+            LogHelper.info(f"[强制音译] 共处理 {forced_count} 个词条")
 
         return words
     
@@ -698,7 +1135,14 @@ class LLM:
         return "".join(result) if result else romaji
 
     # 参考文本翻译任务（新流程：在词义分析之前执行，为其提供上下文理解）
-    async def context_translate(self, word: Word, words: list[Word], success: list[Word], retry: bool) -> None:
+    async def context_translate(self, word: Word, words: list[Word], success: list[Word], retry: bool, task_id: str = "") -> None:
+        import time as time_module
+        start_time = time_module.time()
+        context_str = ""
+        response_result = ""
+        usage = None
+        error = None
+        
         async with self.semaphore, self.async_limiter:
             try:
                 # 获取参考文本（使用增加后的 token 阈值）
@@ -707,13 +1151,23 @@ class LLM:
                 
                 # 如果没有可用的上下文了（所有索引都被排除），降级处理
                 if not context_str or not sampled_indices:
-                    LogHelper.warning(f"[参考文本翻译] 所有上下文都已被排除，跳过翻译阶段（{word.surface}）")
+                    LogTable.print_llm_task(
+                        task_name="参考文本翻译",
+                        word_surface=word.surface,
+                        status="warning",
+                        message="所有上下文都已被排除，跳过翻译阶段",
+                        elapsed_time=time_module.time() - start_time,
+                    )
                     word.context_translation = []
                     with self.lock:
                         success.append(word)
+                    # 更新 tracker
+                    tracker = get_current_tracker()
+                    if tracker and task_id:
+                        tracker.complete_task(task_id, success=True)
                     return
                 
-                error, usage, _, response_result, llm_request, llm_response = await self.do_request(
+                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
                     [
                         {
                             "role": "system",
@@ -725,7 +1179,8 @@ class LLM:
                         },
                     ],
                     LLM.CONTEXT_TRANSLATE_CONFIG,
-                    retry
+                    retry,
+                    task_id=task_id,
                 )
 
                 if error != None:
@@ -739,10 +1194,23 @@ class LLM:
                         # 提升限缩级别
                         if word.context_shrink_level < 3:
                             word.context_shrink_level += 1
-                            LogHelper.warning(f"[参考文本翻译] 敏感内容过滤触发，限缩级别提升至 {word.context_shrink_level}，已排除 {len(word.failed_context_indices)} 个索引（{word.surface}）")
+                            LogTable.print_llm_task(
+                                task_name="参考文本翻译",
+                                word_surface=word.surface,
+                                status="warning",
+                                message=f"敏感内容过滤触发，限缩级别: {word.context_shrink_level}，已排除 {len(word.failed_context_indices)} 个索引",
+                                request_content=context_str,
+                                elapsed_time=time_module.time() - start_time,
+                            )
                         else:
-                            # 已经是单条采样模式，继续重采样（不跳过！）
-                            LogHelper.warning(f"[参考文本翻译] 敏感内容过滤触发，单条重采样模式，已排除 {len(word.failed_context_indices)} 个索引（{word.surface}）")
+                            LogTable.print_llm_task(
+                                task_name="参考文本翻译",
+                                word_surface=word.surface,
+                                status="warning",
+                                message=f"敏感内容过滤触发，单条重采样模式，已排除 {len(word.failed_context_indices)} 个索引",
+                                request_content=context_str,
+                                elapsed_time=time_module.time() - start_time,
+                            )
                     raise error
 
                 # 检查是否超过最大 token 限制
@@ -753,7 +1221,6 @@ class LLM:
                 
                 # 【新增】退化检测：检查整体输出是否存在重复模式
                 if LLM.is_degraded(response_result):
-                    LogHelper.warning(f"[参考文本翻译] 模型退化检测触发（重复输出），将重试 ...（{word.surface}）")
                     raise Exception("模型退化（输出重复内容）")
                 
                 # 【新增】相似度检测：逐行检查，高相似度说明未真正翻译
@@ -770,11 +1237,9 @@ class LLM:
                     
                     # 超过50%的行高相似度，认为翻译基本失效
                     if high_similarity_count > len(original_lines) * 0.5:
-                        LogHelper.warning(f"[参考文本翻译] 相似度检测触发（{high_similarity_count}/{len(original_lines)} 行高相似度），将重试 ...（{word.surface}）")
                         raise Exception(f"翻译失效（相似度过高，{high_similarity_count}/{len(original_lines)} 行）")
                 
                 # 检测翻译是否失效：仅当译文与原文【完全相同】且【原文确实包含明显外文成分】时才报错。
-                # 这样可以避免"纯汉字/符号行本来就无需翻译"的场景被误判，从而减少无意义重试。
                 has_obvious_foreign = re.search(r"[\u3040-\u30FF\uAC00-\uD7AFA-Za-z]", context_str) is not None
                 if len(context_translation) > 0 and context_translation == original_lines and has_obvious_foreign:
                     raise Exception("翻译失效（译文与原文相同） ...")
@@ -782,59 +1247,103 @@ class LLM:
                 word.context_translation = context_translation
                 word.llmrequest_context_translate = llm_request
                 word.llmresponse_context_translate = llm_response
+                
+                # 成功：打印详细日志
+                LogTable.print_llm_task(
+                    task_name="参考文本翻译",
+                    word_surface=word.surface,
+                    status="success",
+                    message=f"上下文翻译完成，{len(context_translation)} 行",
+                    request_content=context_str,
+                    response_content=response_result,
+                    response_think=response_think,
+                    input_tokens=usage.prompt_tokens if usage else 0,
+                    output_tokens=usage.completion_tokens if usage else 0,
+                    elapsed_time=time_module.time() - start_time,
+                    extra_info={
+                        "原文行数": len(original_lines),
+                        "译文行数": len(context_translation),
+                        "采样索引": str(sampled_indices),
+                    },
+                )
             except Exception as e:
-                LogHelper.debug(f"[参考文本翻译] 子任务执行失败: {word.surface} - {e}")
-                LogHelper.debug(f"llm_request - {llm_request}")
-                LogHelper.debug(f"llm_response - {llm_response}")
+                # 失败：打印详细错误日志
+                LogTable.print_llm_task(
+                    task_name="参考文本翻译",
+                    word_surface=word.surface,
+                    status="error",
+                    message=f"任务失败: {str(e)}",
+                    request_content=context_str if context_str else None,
+                    response_content=response_result if response_result else None,
+                    input_tokens=usage.prompt_tokens if usage else 0,
+                    output_tokens=usage.completion_tokens if usage else 0,
+                    elapsed_time=time_module.time() - start_time,
+                )
                 error = e
             finally:
+                # 更新全局 tracker 状态
+                tracker = get_current_tracker()
+                if tracker and task_id:
+                    tracker.complete_task(task_id, success=(error is None), error=str(error) if error else None)
+                
                 if error == None:
                     with self.lock:
                         success.append(word)
-                    LogHelper.info(f"[参考文本翻译] 已完成 {len(success)} / {len(words)} ...")
 
     # 批量执行参考文本翻译任务
     async def context_translate_batch(self, words: list[Word]) -> list[Word]:
+        import time as time_module
+        batch_start_time = time_module.time()
+        
         failure: list[Word] = []
         success: list[Word] = []
 
+        # 打印阶段标题
+        LogTable.print_stage_header("参考文本翻译", stage_num=1)
+        LogHelper.info(f"待处理词条数: {len(words)}")
         LogHelper.print("")
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("/"),
-            TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task("[cyan]参考文本翻译", total=len(words))
-            
-            for i in range(LLM.MAX_RETRY + 1):
-                if i == 0:
-                    retry = False
-                    words_this_round = words
-                elif len(failure) > 0:
-                    retry = True
-                    words_this_round = failure
-                    progress.update(task, description=f"[yellow]参考文本翻译 (重试 {i}/{LLM.MAX_RETRY})")
-                else:
-                    break
-
-                # 执行异步任务
-                async def run_with_progress(word: Word):
-                    await self.context_translate(word, words, success, retry)
-                    progress.update(task, completed=len(success))
-                
-                tasks = [asyncio.create_task(run_with_progress(word)) for word in words_this_round]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                # 获得失败任务的列表
-                success_pairs = {(word.surface, word.group) for word in success}
-                failure = [word for word in words if (word.surface, word.group) not in success_pairs]
         
-        LogHelper.print("")
+        # 使用 TaskTracker 替代 Progress，实现常驻底部面板
+        with TaskTracker(total=len(words), task_name="参考文本翻译", max_concurrent=self.max_concurrent_requests) as tracker:
+            # 设置全局 tracker，供流式请求更新
+            set_current_tracker(tracker)
+            
+            try:
+                for i in range(LLM.MAX_RETRY + 1):
+                    if i == 0:
+                        retry = False
+                        words_this_round = words
+                    elif len(failure) > 0:
+                        retry = True
+                        words_this_round = failure
+                        tracker.add_retry()
+                        tracker.set_description(f"[yellow]参考文本翻译 (重试 {i}/{LLM.MAX_RETRY})")
+                    else:
+                        break
+
+                    # 执行异步任务，传递 task_id 给每个任务
+                    async def run_with_tracker(word: Word, task_idx: int):
+                        task_id = f"ct_{task_idx}_{word.surface}"
+                        await self.context_translate(word, words, success, retry, task_id=task_id)
+                    
+                    tasks = [asyncio.create_task(run_with_tracker(word, idx)) for idx, word in enumerate(words_this_round)]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # 获得失败任务的列表
+                    success_pairs = {(word.surface, word.group) for word in success}
+                    failure = [word for word in words if (word.surface, word.group) not in success_pairs]
+            finally:
+                # 清除全局 tracker
+                set_current_tracker(None)
+        
+        # 打印批量汇总
+        LogTable.print_batch_summary(
+            task_name="参考文本翻译",
+            total=len(words),
+            success=len(success),
+            failed=len(failure),
+            elapsed_time=time_module.time() - batch_start_time,
+        )
 
         return words
 
@@ -865,10 +1374,15 @@ class LLM:
             success: 成功列表
             total: 总数
         """
+        import time as time_module
+        start_time = time_module.time()
+        
         async with self.semaphore, self.async_limiter:
             error = None
             llm_request = {}
             llm_response = {}
+            response_result = ""
+            usage = None
             
             try:
                 # 构建修复请求
@@ -892,7 +1406,7 @@ class LLM:
                 fix_config.MAX_TOKENS = LLM.FixConfig.MAX_TOKENS
                 fix_config.FREQUENCY_PENALTY = LLM.FixConfig.FREQUENCY_PENALTY
                 
-                error, usage, _, response_result, llm_request, llm_response = await self.do_request(
+                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
                     [
                         {
                             "role": "system",
@@ -920,7 +1434,6 @@ class LLM:
                 
                 # 验证新译名是否仍有假名
                 if LLM.contains_kana_strict(new_translation):
-                    LogHelper.warning(f"[问题修复] 修复失败（仍有假名）: {word.surface} → {new_translation}，使用强制音译")
                     new_translation = self.force_transliterate(word.surface)
                     confidence = "forced"
                 
@@ -930,18 +1443,44 @@ class LLM:
                 word.llmrequest_fix = llm_request
                 word.llmresponse_fix = llm_response
                 
-                LogHelper.info(f"[问题修复] {word.surface}: {old_translation} → {new_translation} [{confidence}]")
+                # 打印成功日志
+                LogTable.print_llm_task(
+                    task_name="问题修复",
+                    word_surface=word.surface,
+                    status="success",
+                    message=f"{old_translation} → {new_translation} [{confidence}]",
+                    request_content=user_content,
+                    response_content=response_result,
+                    response_think=response_think,
+                    input_tokens=usage.prompt_tokens if usage else 0,
+                    output_tokens=usage.completion_tokens if usage else 0,
+                    elapsed_time=time_module.time() - start_time,
+                    extra_info={
+                        "原译名": old_translation,
+                        "新译名": new_translation,
+                        "置信度": confidence,
+                    },
+                )
                 
             except Exception as e:
-                LogHelper.warning(f"[问题修复] 失败，使用强制音译: {word.surface} - {LogHelper.get_trackback(e)}")
                 # 修复失败，使用强制音译
-                word.surface_translation = self.force_transliterate(word.surface)
+                forced_translation = self.force_transliterate(word.surface)
+                LogTable.print_llm_task(
+                    task_name="问题修复",
+                    word_surface=word.surface,
+                    status="warning",
+                    message=f"LLM 失败，强制音译: {word.surface_translation} → {forced_translation}",
+                    request_content=user_content if 'user_content' in dir() else None,
+                    response_content=response_result if response_result else None,
+                    elapsed_time=time_module.time() - start_time,
+                    extra_info={"错误": str(e)},
+                )
+                word.surface_translation = forced_translation
                 error = None  # 强制音译成功，不算错误
             finally:
                 if error is None:
                     with self.lock:
                         success.append(word)
-                    LogHelper.info(f"[问题修复] 已完成 {len(success)} / {total} ...")
     
     async def fix_translation_batch(self, words: list[Word]) -> list[Word]:
         """
@@ -958,37 +1497,52 @@ class LLM:
         Returns:
             修复后的词条列表
         """
+        import time as time_module
+        batch_start_time = time_module.time()
+        
         # 加载 prompt
         self.load_fix_prompt()
         if not self.prompt_fix_translation:
             LogHelper.warning("[问题修复] 跳过（无 prompt）")
             return words
         
+        # 打印阶段标题
+        LogTable.print_stage_header("问题修复", stage_num=3)
+        
         # 筛选问题词条
         problem_words = []
+        problem_reasons = {}
         for word in words:
             translation = word.surface_translation or ""
             
             # 条件1: 假名残留
             if LLM.contains_kana_strict(translation):
                 problem_words.append(word)
+                problem_reasons[word.surface] = "假名残留"
                 continue
             
             # 条件2: 相似度过高
             if translation and LLM.check_similarity(word.surface, translation) >= 0.80:
                 problem_words.append(word)
+                problem_reasons[word.surface] = "相似度过高"
                 continue
             
             # 条件3: 空翻译
             if not translation.strip():
                 problem_words.append(word)
+                problem_reasons[word.surface] = "空翻译"
                 continue
         
         if not problem_words:
             LogHelper.info("[问题修复] 无需修复，所有词条正常")
             return words
         
-        LogHelper.info(f"[问题修复] 发现 {len(problem_words)} 个问题词条，开始修复...")
+        # 打印问题词条列表
+        LogHelper.info(f"发现 {len(problem_words)} 个问题词条:")
+        for word in problem_words:
+            reason = problem_reasons.get(word.surface, "未知")
+            LogHelper.print(f"  • {word.surface} → {word.surface_translation or '(空)'} [dim]({reason})[/dim]")
+        LogHelper.print("")
         
         success = []
         tasks = [
@@ -998,9 +1552,29 @@ class LLM:
         await asyncio.gather(*tasks, return_exceptions=True)
         
         # 最终兜底：对仍有假名的词条强制音译
+        forced_count = 0
         for word in words:
             if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
-                LogHelper.warning(f"[最终兜底] 强制音译: {word.surface}")
+                old_trans = word.surface_translation
                 word.surface_translation = self.force_transliterate(word.surface)
+                LogTable.print_llm_task(
+                    task_name="最终兜底",
+                    word_surface=word.surface,
+                    status="warning",
+                    message=f"强制音译: {old_trans} → {word.surface_translation}",
+                )
+                forced_count += 1
+        
+        # 打印批量汇总
+        LogTable.print_batch_summary(
+            task_name="问题修复",
+            total=len(problem_words),
+            success=len(success),
+            failed=len(problem_words) - len(success),
+            elapsed_time=time_module.time() - batch_start_time,
+        )
+        
+        if forced_count > 0:
+            LogHelper.info(f"[最终兜底] 强制音译处理了 {forced_count} 个词条")
         
         return words
