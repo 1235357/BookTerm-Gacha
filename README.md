@@ -81,7 +81,7 @@ BookTerm Gacha automates this process:
 
 **For users who just want to get started quickly:**
 
-1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTermGacha/releases)
+1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTerm-Gacha/releases)
 2. Extract the ZIP file to any folder
 3. Get a FREE API key from [Zhipu AI](https://bigmodel.cn/)
 4. Edit `config.json` and add your API key
