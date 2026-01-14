@@ -1,1 +1,1 @@
-v0.1.0-Zhipu_GLM-Optimize
+v0.2.0-Multi-Platform-API-Rotation

@@ -1,16 +1,66 @@
 {
-    "api_key": [
-        "",
-        "接口密钥，从接口平台方获取，使用在线接口时一定要设置正确。"
-    ],
-    "base_url": [
-        "https://open.bigmodel.cn/api/paas/v4",
-        "请求地址，从接口平台方获取，使用在线接口时一定要设置正确。"
-    ],
-    "model_name": [
-        "glm-4.6v-flash",
-        "模型名称，从接口平台方获取，使用在线接口时一定要设置正确。",
-        "免费模型：glm-4.6v-flash（免费）, glm-4-flash（免费）"
+    "activate_platform": 1,
+    "platforms": [
+        {
+            "id": 0,
+            "name": "智谱GLM-4.6v-flash(免费)",
+            "api_url": "https://open.bigmodel.cn/api/paas/v4",
+            "api_key": [
+
+            ],
+            "model": "glm-4.6v-flash",
+            "thinking": true,
+            "top_p": 0.95,
+            "temperature": 0.05,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "description": "智谱免费模型，支持深度思考"
+        },
+        {
+            "id": 1,
+            "name": "NVIDIA-DeepSeek-V3.2",
+            "api_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": [
+
+            ],
+            "model": "deepseek-ai/deepseek-v3.2",
+            "thinking": true,
+            "top_p": 0.95,
+            "temperature": 0.95,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "description": "NVIDIA Build DeepSeek V3.2，5个API Key轮询"
+        },
+        {
+            "id": 2,
+            "name": "魔塔-DeepSeek-V3.2",
+            "api_url": "https://api-inference.modelscope.cn/v1/",
+            "api_key": [
+
+            ],
+            "model": "deepseek-ai/DeepSeek-V3.2",
+            "thinking": true,
+            "top_p": 0.95,
+            "temperature": 0.95,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "description": "阿里云百炼 ModelScope DeepSeek V3.2，5个API Key轮询"
+        },
+        {
+            "id": 3,
+            "name": "魔塔-DeepSeek-R1-0528",
+            "api_url": "https://api-inference.modelscope.cn/v1/",
+            "api_key": [
+
+            ],
+            "model": "deepseek-ai/DeepSeek-R1-0528",
+            "thinking": true,
+            "top_p": 0.95,
+            "temperature": 0.95,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "description": "阿里云百炼 ModelScope DeepSeek R1"
+        }
     ],
     "count_threshold": [
         2,
@@ -21,15 +71,15 @@
         "网络请求超时时间，如果频繁出现 timeout 字样的网络错误，可以调大这个值。"
     ],
     "request_frequency_threshold": [
-        5,
+        10,
         "网络请求频率阈值，单位为 次/秒，值可以小于 1，如果频繁出现 429 代码的网络错误，可以调小这个值。",
         "使用 llama.cpp 运行的本地模型时，将根据 llama.cpp 的配置调整自动设置，无需手动调整这个值。",
-        "使用智谱免费API时建议设为 5 或更低，避免并发限制。"
+        "使用多API轮询时建议设为 5-10，充分利用并发能力。"
     ],
     "max_concurrent_requests": [
-        5,
+        90,
         "最大并发请求数，同时进行的请求数量上限。",
-        "设置较小的值（如 3-5）可以有效避免 429 并发限制错误。",
+        "使用多API轮询时可以适当增加（如 5-10），充分利用多Key并发。",
         "此值与 request_frequency_threshold 共同控制并发：并发数 = min(max_concurrent_requests, request_frequency_threshold)。"
     ],
     "traditional_chinese_enable": [
@@ -47,7 +97,7 @@
         "用于过滤异常的超长术语。"
     ],
     "max_context_samples": [
-        3,
+        5,
         "上下文采样数量，从同一词语出现的不同位置采样多少条上下文。",
         "值越大提供的语境越丰富，但会增加 token 消耗。建议 5-15。"
     ],
@@ -62,5 +112,11 @@
         "可选值：PER(人名)、LOC(地点)、ORG(组织)、PRD(产品/作品)。",
         "默认只保留 PER 和 LOC，可大幅减少后续 LLM 调用次数。",
         "如需保留全部类型，设为 [\"PER\", \"LOC\", \"ORG\", \"PRD\"]。"
+    ],
+    "task_timeout_threshold": [
+        600,
+        "单任务超时阈值（秒），超过此时间将触发上下文限缩策略。",
+        "当某个词条处理时间过长时，会自动减少参考上下文数量并重试。",
+        "建议范围 300-600 秒，默认 430 秒。"
     ]
 }

@@ -14,6 +14,7 @@ BookTerm Gacha - Log Table Module (重构版)
 Based on LinguaGacha's TranslatorTask.py
 """
 
+import sys
 import itertools
 import time
 from typing import Optional
@@ -48,10 +49,9 @@ class LogTable:
     
     @classmethod
     def get_console(cls) -> Console:
-        """获取控制台实例"""
-        if cls._console is None:
-            cls._console = Console(width=cls.CONSOLE_WIDTH, highlight=True)
-        return cls._console
+        """获取控制台实例 (代理到 LogHelper)"""
+        # 始终尽可能复用 LogHelper 中的全局 Console
+        return LogHelper.get_console()
     
     # ==================== 阶段标题 ====================
     

@@ -341,11 +341,30 @@ def print_app_info(config: SimpleNamespace, version: str) -> None:
     table.add_column("", style = "white", ratio = 5, overflow = "fold")
 
     rows = []
+    
+    # 显示平台名称（如果有）
+    platform_name = getattr(config, 'platform_name', None)
+    if platform_name:
+        rows.append(("当前平台", f"[bold cyan]{platform_name}[/]"))
+    
     rows.append(("模型名称", str(config.model_name)))
-    rows.append(("接口密钥", str(config.api_key)))
+    
+    # API Key 显示优化（支持多 Key）
+    api_key = config.api_key
+    if isinstance(api_key, list):
+        if len(api_key) > 1:
+            rows.append(("API Key", f"[green]{len(api_key)} 个 Key (轮询模式)[/]"))
+        elif len(api_key) == 1:
+            rows.append(("API Key", f"{api_key[0][:20]}..."))
+        else:
+            rows.append(("API Key", "[red]未配置[/]"))
+    else:
+        rows.append(("API Key", str(api_key)[:40] + "..." if len(str(api_key)) > 40 else str(api_key)))
+    
     rows.append(("接口地址", str(config.base_url)))
     rows.append(("网络请求超时时间", f"{config.request_timeout} 秒"))
     rows.append(("网络请求频率阈值", f"{config.request_frequency_threshold} 次/秒"))
+    rows.append(("最大并发请求数", f"{getattr(config, 'max_concurrent_requests', 5)} 个"))
     rows.append(("参考文本翻译模式", "新流程：先翻译后分析（强制启用）"))
 
     for row in rows:
@@ -354,6 +373,7 @@ def print_app_info(config: SimpleNamespace, version: str) -> None:
 
     LogHelper.print()
     LogHelper.print("请编辑 [green]config.json[/] 文件来修改应用设置 ...")
+    LogHelper.print("提示: 修改 [cyan]activate_platform[/] 字段来切换不同的 API 平台")
     LogHelper.print()
 
 # 打印菜单
@@ -401,6 +421,7 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
     with LogHelper.status("正在初始化 [green] BookTerm Gacha [/] 引擎 ..."):
         config = SimpleNamespace()
         version = ""
+        raw_config = {}
 
         try:
             # 优先使用开发环境配置文件
@@ -411,14 +432,57 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
 
             # 读取配置文件
             with open(path, "r", encoding = "utf-8-sig") as reader:
-                for k, v in json.load(reader).items():
-                    setattr(config, k, v[0])
+                raw_config = json.load(reader)
+
+            # ============== 新配置格式：多平台支持 ==============
+            if "platforms" in raw_config and "activate_platform" in raw_config:
+                # 新格式：多平台配置
+                platforms = raw_config.get("platforms", [])
+                activate_id = raw_config.get("activate_platform", 0)
+                
+                # 找到激活的平台配置
+                active_platform = None
+                for platform in platforms:
+                    if platform.get("id") == activate_id:
+                        active_platform = platform
+                        break
+                
+                if active_platform is None and platforms:
+                    active_platform = platforms[0]  # 默认使用第一个
+                    LogHelper.warning(f"[配置警告] 未找到 ID={activate_id} 的平台，使用默认平台: {active_platform.get('name', 'Unknown')}")
+                
+                if active_platform:
+                    # 从平台配置提取 API 设置
+                    config.api_key = active_platform.get("api_key", [])
+                    config.base_url = active_platform.get("api_url", "")
+                    config.model_name = active_platform.get("model", "")
+                    config.platform_name = active_platform.get("name", "Unknown")
+                    config.thinking = active_platform.get("thinking", True)
+                    config.top_p = active_platform.get("top_p", 0.95)
+                    config.temperature = active_platform.get("temperature", 0.05)
+                    
+                    LogHelper.info(f"[多平台配置] 已加载平台: [bold cyan]{config.platform_name}[/]")
+                    api_keys = config.api_key
+                    if isinstance(api_keys, list) and len(api_keys) > 1:
+                        LogHelper.info(f"[多API轮询] 检测到 {len(api_keys)} 个 API Key，已启用轮询模式")
+                
+                # 加载其他配置项（使用 [value, description] 格式）
+                for k, v in raw_config.items():
+                    if k not in ("platforms", "activate_platform"):
+                        if isinstance(v, list) and len(v) > 0 and not k.startswith("api"):
+                            setattr(config, k, v[0])  # 取第一个元素作为值
+                        elif not isinstance(v, list):
+                            setattr(config, k, v)
+            else:
+                # ============== 旧配置格式：向后兼容 ==============
+                for k, v in raw_config.items():
+                    setattr(config, k, v[0] if isinstance(v, list) else v)
 
             # 读取版本号文件
             with open("version.txt", "r", encoding = "utf-8-sig") as reader:
                 version = reader.read().strip()
-        except Exception:
-            LogHelper.error("配置文件读取失败 ...")
+        except Exception as e:
+            LogHelper.error(f"配置文件读取失败: {e}")
 
         # ============== 从配置加载全局参数 ==============
         # 置信度阈值
@@ -430,6 +494,12 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
             max_context_samples=getattr(config, 'max_context_samples', 10),
             tokens_per_sample=getattr(config, 'tokens_per_sample', 512)
         )
+        # LLM 类的超时阈值配置
+        task_timeout = getattr(config, 'task_timeout_threshold', 430)
+        LLM.TASK_TIMEOUT_THRESHOLD = task_timeout
+        
+        # 重置 API 状态（每次启动时清除黑名单和轮询索引）
+        LLM.reset_api_state()
 
         # 初始化 LLM 对象
         llm = LLM(config)
@@ -454,6 +524,7 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
         LogHelper.info(f"术语最大长度: {MAX_DISPLAY_LENGTH}")
         LogHelper.info(f"上下文采样数: {Word.MAX_CONTEXT_SAMPLES}")
         LogHelper.info(f"每样本Token数: {Word.TOKENS_PER_SAMPLE}")
+        LogHelper.info(f"任务超时阈值: {LLM.TASK_TIMEOUT_THRESHOLD}s")
         LogHelper.info(f"NER目标类型: {', '.join(ner_target_types)}")
         if traditional_chinese_enable:
             LogHelper.info("繁体中文输出已启用 ...")

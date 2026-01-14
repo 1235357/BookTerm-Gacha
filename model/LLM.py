@@ -61,6 +61,10 @@ class LLM:
     RE_DASHSCOPE_DEEPSEEK_URL: re.Pattern = re.compile(r"api-inference\.modelscope\.cn", flags=re.IGNORECASE)
     RE_DASHSCOPE_DEEPSEEK_MODEL: re.Pattern = re.compile(r"deepseek-ai", flags=re.IGNORECASE)
     
+    # NVIDIA Build DeepSeek 模型检测
+    RE_NVIDIA_DEEPSEEK_URL: re.Pattern = re.compile(r"integrate\.api\.nvidia\.com", flags=re.IGNORECASE)
+    RE_NVIDIA_DEEPSEEK_MODEL: re.Pattern = re.compile(r"deepseek-ai", flags=re.IGNORECASE)
+    
     # OpenAI O系列模型 (o1, o3-mini, o4-mini-20240406 等)
     RE_O_SERIES: re.Pattern = re.compile(r"o\d$|o\d-", flags=re.IGNORECASE)
     
@@ -72,6 +76,9 @@ class LLM:
     
     # 多行压缩
     RE_LINE_BREAK: re.Pattern = re.compile(r"\n+")
+    
+    # 黑名单错误关键词（API Key 被封禁）
+    RE_BLACKLIST_ERROR: re.Pattern = re.compile(r"blacklist|banned|suspended|prohibited", flags=re.IGNORECASE)
 
     # ==================== 任务类型 ====================
 
@@ -93,6 +100,20 @@ class LLM:
     
     # 强制音译阈值
     FORCE_TRANSLITERATE_THRESHOLD: int = 16
+    
+    # 单任务超时阈值（秒）- 超过此时间触发上下文限缩
+    TASK_TIMEOUT_THRESHOLD: int = 430
+
+    # ==================== 多 API Key 轮询管理（借鉴 TaskRequester.py） ====================
+    
+    # 类级别变量 - API Key 轮询索引
+    API_KEY_INDEX: int = 0
+    
+    # 类级别变量 - API Key 黑名单（存储被封禁的 Key）
+    BLACKLISTED_KEYS: set[str] = set()
+    
+    # 类线程锁
+    KEY_LOCK: threading.Lock = threading.Lock()
 
     # 类型映射表
     GROUP_MAPPING = {
@@ -112,10 +133,82 @@ class LLM:
         "地点" : [],
     }
 
+    # ==================== API Key 轮询管理（借鉴 TaskRequester.py）====================
+    
+    @classmethod
+    def reset_api_state(cls) -> None:
+        """重置 API 状态（每次任务开始前调用）"""
+        cls.API_KEY_INDEX = 0
+        cls.BLACKLISTED_KEYS.clear()
+        LogHelper.debug("[API状态] 已重置 Key 索引和黑名单")
+    
+    @classmethod
+    def add_to_blacklist(cls, key: str) -> None:
+        """将 Key 加入黑名单"""
+        with cls.KEY_LOCK:
+            cls.BLACKLISTED_KEYS.add(key)
+            LogHelper.warning(f"[API黑名单] Key 已被加入黑名单: {key[:20]}...")
+    
+    @classmethod
+    def is_blacklisted(cls, key: str) -> bool:
+        """检查 Key 是否在黑名单中"""
+        with cls.KEY_LOCK:
+            return key in cls.BLACKLISTED_KEYS
+    
+    @classmethod
+    def get_available_key_count(cls, keys: list[str]) -> int:
+        """获取可用 Key 数量"""
+        with cls.KEY_LOCK:
+            return sum(1 for k in keys if k not in cls.BLACKLISTED_KEYS)
+    
+    @classmethod
+    def get_key(cls, keys: list[str]) -> str:
+        """
+        获取下一个可用的 API Key（轮询机制）
+        
+        参照 TaskRequester.py 的 get_key 方法
+        - 支持单个 Key 或多个 Key 列表
+        - 自动跳过被封禁的 Key
+        - 轮询可用 Key
+        """
+        key: str = ""
+        
+        # 兼容：如果传入的是字符串而非列表
+        if isinstance(keys, str):
+            keys = [keys]
+        
+        if len(keys) == 0:
+            key = "no_key_required"
+        elif len(keys) == 1:
+            key = keys[0]
+            # 检查单个 Key 是否被封禁
+            if cls.is_blacklisted(key):
+                raise RuntimeError(f"所有 API Key 均已被封禁，无法继续执行任务。请检查 API Key 状态或联系服务提供商。")
+        else:
+            # 尝试找到一个未被封禁的 Key
+            available_keys = [k for k in keys if not cls.is_blacklisted(k)]
+            if len(available_keys) == 0:
+                raise RuntimeError(f"所有 API Key 均已被封禁，无法继续执行任务。请检查 API Key 状态或联系服务提供商。")
+            
+            # 在可用 Key 中轮询
+            with cls.KEY_LOCK:
+                key = available_keys[cls.API_KEY_INDEX % len(available_keys)]
+                cls.API_KEY_INDEX = (cls.API_KEY_INDEX + 1) % len(available_keys)
+        
+        return key
+
     # ==================== 初始化 ====================
 
     def __init__(self, config: SimpleNamespace) -> None:
-        self.api_key = config.api_key
+        # 支持多 API Key（兼容旧配置）
+        api_key = config.api_key
+        if isinstance(api_key, list):
+            self.api_keys = api_key  # 多 Key 列表
+            self.api_key = api_key[0] if api_key else ""  # 向后兼容
+        else:
+            self.api_keys = [api_key] if api_key else []  # 单 Key 转列表
+            self.api_key = api_key
+        
         self.base_url = config.base_url
         self.model_name = config.model_name
         self.request_timeout = config.request_timeout
@@ -125,6 +218,12 @@ class LLM:
 
         # 初始化工具
         self.kakasi = pykakasi.kakasi()
+        
+        # 客户端缓存（key -> client）
+        self._clients: dict[str, AsyncOpenAI] = {}
+        self._stream_clients: dict[str, AsyncOpenAI] = {}
+        
+        # 创建初始客户端（向后兼容）
         self.client = self._create_client()
         self.stream_client = self._create_client_no_timeout()
 
@@ -133,10 +232,14 @@ class LLM:
         
         # 平台检测缓存
         self._platform_info: Optional[dict] = None
+        
+        # 打印多 Key 信息
+        if len(self.api_keys) > 1:
+            LogHelper.info(f"[多API轮询] 检测到 {len(self.api_keys)} 个 API Key，已启用轮询机制")
 
     # ==================== 客户端创建（借鉴 TaskRequester.py） ====================
 
-    def _create_client(self) -> AsyncOpenAI:
+    def _create_client(self, api_key: str = None) -> AsyncOpenAI:
         """
         创建标准 OpenAI 客户端
         
@@ -145,9 +248,13 @@ class LLM:
         - read: request_timeout (等待响应)
         - write: 8秒 (发送请求)
         - pool: 8秒 (连接池)
+        
+        Args:
+            api_key: 可选，指定使用的 API Key。如果不指定，使用默认的 self.api_key
         """
+        key = api_key or self.api_key
         return AsyncOpenAI(
-            api_key=self.api_key,
+            api_key=key,
             base_url=self.base_url,
             timeout=httpx.Timeout(
                 read=self.request_timeout,
@@ -158,18 +265,34 @@ class LLM:
             max_retries=1,
         )
     
-    def _create_client_no_timeout(self) -> AsyncOpenAI:
+    def _create_client_no_timeout(self, api_key: str = None) -> AsyncOpenAI:
         """
         创建无超时客户端（用于深度思考流式输出）
         
-        智谱深度思考、阿里云百炼 DeepSeek 等需要长时间思考的场景
+        智谱深度思考、阿里云百炼 DeepSeek、NVIDIA Build DeepSeek 等需要长时间思考的场景
+        
+        Args:
+            api_key: 可选，指定使用的 API Key。如果不指定，使用默认的 self.api_key
         """
+        key = api_key or self.api_key
         return AsyncOpenAI(
-            api_key=self.api_key,
+            api_key=key,
             base_url=self.base_url,
             timeout=httpx.Timeout(None),  # 完全禁用超时
             max_retries=1,
         )
+    
+    def _get_client_for_key(self, api_key: str) -> AsyncOpenAI:
+        """获取指定 Key 的客户端（使用缓存）"""
+        if api_key not in self._clients:
+            self._clients[api_key] = self._create_client(api_key)
+        return self._clients[api_key]
+    
+    def _get_stream_client_for_key(self, api_key: str) -> AsyncOpenAI:
+        """获取指定 Key 的无超时客户端（使用缓存）"""
+        if api_key not in self._stream_clients:
+            self._stream_clients[api_key] = self._create_client_no_timeout(api_key)
+        return self._stream_clients[api_key]
 
     # ==================== 平台检测（借鉴 TaskRequester.py） ====================
 
@@ -181,6 +304,7 @@ class LLM:
         - platform: 平台名称
         - is_zhipu: 是否智谱
         - is_dashscope_deepseek: 是否阿里云百炼 DeepSeek
+        - is_nvidia_deepseek: 是否 NVIDIA Build DeepSeek
         - is_o_series: 是否 OpenAI O系列
         - is_qwen3: 是否 QWEN3
         - thinking_enabled: 是否启用深度思考
@@ -193,6 +317,7 @@ class LLM:
             "platform": "openai_compatible",
             "is_zhipu": False,
             "is_dashscope_deepseek": False,
+            "is_nvidia_deepseek": False,  # 新增 NVIDIA 支持
             "is_o_series": False,
             "is_qwen3": False,
             "is_gemini": False,
@@ -207,12 +332,23 @@ class LLM:
             info["stream_required"] = True  # 智谱深度思考必须用流式
             LogHelper.info(f"[平台检测] 检测到 [bold green]智谱 API[/] - 启用深度思考 + 流式输出")
         
+        # NVIDIA Build DeepSeek 检测（优先于阿里云百炼检测）
+        elif self.RE_NVIDIA_DEEPSEEK_URL.search(self.base_url) and self.RE_NVIDIA_DEEPSEEK_MODEL.search(self.model_name):
+            info["platform"] = "nvidia_deepseek"
+            info["is_nvidia_deepseek"] = True
+            info["stream_required"] = True  # NVIDIA DeepSeek 深度思考必须用流式
+            LogHelper.info(f"[平台检测] 检测到 [bold magenta]NVIDIA Build DeepSeek[/] - 启用深度思考 + 流式输出")
+            if len(self.api_keys) > 1:
+                LogHelper.info(f"[多API轮询] 已配置 {len(self.api_keys)} 个 NVIDIA API Key")
+        
         # 阿里云百炼 DeepSeek 检测
         elif self.RE_DASHSCOPE_DEEPSEEK_URL.search(self.base_url) and self.RE_DASHSCOPE_DEEPSEEK_MODEL.search(self.model_name):
             info["platform"] = "dashscope_deepseek"
             info["is_dashscope_deepseek"] = True
             info["stream_required"] = True  # DeepSeek 深度思考必须用流式
             LogHelper.info(f"[平台检测] 检测到 [bold green]阿里云百炼 DeepSeek[/] - 启用深度思考 + 流式输出")
+            if len(self.api_keys) > 1:
+                LogHelper.info(f"[多API轮询] 已配置 {len(self.api_keys)} 个 ModelScope API Key")
         
         # OpenAI O系列检测
         elif self.RE_O_SERIES.search(self.model_name):
@@ -434,11 +570,17 @@ class LLM:
             LLM.CONTEXT_TRANSLATE_CONFIG.MAX_TOKENS = 16 * 1024
 
         # 设置请求限制器
-        # 并发数 = min(max_concurrent_requests, request_frequency_threshold)
-        # max_concurrent_requests 控制同时进行的请求数上限
-        # request_frequency_threshold 控制每秒的请求频率
-        concurrent_limit = min(self.max_concurrent_requests, max(1, int(self.request_frequency_threshold)))
-        LogHelper.info(f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {self.request_frequency_threshold} 次/秒")
+        # 【重要】两个参数是独立的概念：
+        # - max_concurrent_requests: 控制同时在空中飞行的请求数量上限（并发槽位）
+        # - request_frequency_threshold: 控制每秒发送新请求的频率（发送速度）
+        # 
+        # 例如：max_concurrent=90, frequency=10
+        # 意味着：每秒发10个请求，但如果每个请求需要9秒返回，那么第9秒时就会有90个请求同时在飞行
+        # 
+        # 这对于多API Key轮询场景非常重要！
+        concurrent_limit = max(1, self.max_concurrent_requests)
+        frequency_limit = max(1, int(self.request_frequency_threshold))
+        LogHelper.info(f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {frequency_limit} 次/秒")
         
         if self.request_frequency_threshold > 1:
             self.semaphore = asyncio.Semaphore(concurrent_limit)
@@ -587,11 +729,22 @@ class LLM:
                 "thinking": {"type": "enabled"}  # 【强制启用深度思考】
             }
         
+        # ========== NVIDIA Build DeepSeek 优化 ==========
+        elif platform_info.get("is_nvidia_deepseek"):
+            args["stream"] = True
+            args["stream_options"] = {"include_usage": True}
+            # NVIDIA 专用思考模式启用方式
+            args["extra_body"] = {"chat_template_kwargs": {"thinking": True}}
+            # NVIDIA Build 限制 16384 max_tokens
+            args["max_tokens"] = min(16384, max(4 * 1024, int(llm_config.MAX_TOKENS)))
+        
         # ========== 阿里云百炼 DeepSeek 优化 ==========
         elif platform_info.get("is_dashscope_deepseek"):
             args["stream"] = True
             args["stream_options"] = {"include_usage": True}
             args["extra_body"] = {"enable_thinking": True}  # 强制启用思考模式
+            # ModelScope 支持 32768 max_tokens
+            args["max_tokens"] = min(32768, max(4 * 1024, int(llm_config.MAX_TOKENS)))
         
         # ========== OpenAI O系列优化 ==========
         elif platform_info.get("is_o_series"):
@@ -611,7 +764,12 @@ class LLM:
         """
         执行流式请求（用于深度思考模式）
         
-        参照 TaskRequester.py 的 request_dashscope_deepseek_streaming
+        参照 TaskRequester.py 的 request_dashscope_deepseek_streaming / request_nvidia_deepseek_streaming
+        
+        【多 API Key 轮询支持】
+        - 每次请求从 api_keys 列表中轮询选择一个可用的 Key
+        - 被封禁的 Key 自动加入黑名单，不再使用
+        
         【无刷屏版】- 更新全局 TaskTracker 而不是创建单独的 Live
         
         Args:
@@ -619,6 +777,8 @@ class LLM:
             task_id: 任务标识（用于更新 tracker）
         """
         import time
+        from openai import PermissionDeniedError
+        
         start_time = time.time()
         
         response_think = ""
@@ -631,9 +791,15 @@ class LLM:
         # 获取全局 tracker
         tracker = get_current_tracker()
         
+        # 获取当前使用的 Key（多 Key 轮询）
+        current_key = LLM.get_key(self.api_keys)
+        
         try:
-            # 使用无超时客户端
-            stream = await self.stream_client.chat.completions.create(**llm_request)
+            # 获取对应 Key 的无超时客户端
+            stream_client = self._get_stream_client_for_key(current_key)
+            
+            # 发起流式请求
+            stream = await stream_client.chat.completions.create(**llm_request)
             
             async for chunk in stream:
                 chunk_count += 1
@@ -685,6 +851,32 @@ class LLM:
             # 清理格式
             response_think = self.RE_LINE_BREAK.sub("\n", response_think.strip())
             response_result = response_result.strip()
+        
+        except PermissionDeniedError as e:
+            # 403 错误 - 检查是否为黑名单封禁
+            error_msg = str(e)
+            if self.RE_BLACKLIST_ERROR.search(error_msg):
+                # 将该 Key 加入黑名单
+                LLM.add_to_blacklist(current_key)
+                LogHelper.error(f"")
+                LogHelper.error(f"[致命错误] API Key 已被服务商封禁: {current_key[:20]}...")
+                LogHelper.error(f"[致命错误] 封禁原因: {error_msg}")
+                LogHelper.error(f"")
+                
+                # 检查是否还有可用的 Key
+                available_count = LLM.get_available_key_count(self.api_keys)
+                if available_count > 0:
+                    LogHelper.warning(f"[API轮询] 剩余可用 Key: {available_count} 个，继续使用其他 Key")
+                else:
+                    LogHelper.error(f"[致命错误] 所有 API Key 均已被封禁，任务无法继续！")
+            else:
+                LogHelper.error(f"[流式请求] 权限错误: {e}")
+            raise
+        
+        except RuntimeError as e:
+            # 所有 Key 被封禁的异常
+            LogHelper.error(f"[致命错误] {e}")
+            raise
             
         except Exception as e:
             LogHelper.error(f"[流式请求] 失败: {e}")
@@ -752,8 +944,16 @@ class LLM:
                     y = [v for group in LLM.GROUP_MAPPING_BANNED.values() for v in group]
                     self.prompt_groups = x + y
 
-                # 获取参考文本原文
-                context_original = word.get_context_str_for_surface_analysis(self.language)
+                # 获取参考文本原文（注意：这里也使用 context_shrink_level 来控制采样量）
+                # 【新增】根据限缩级别动态调整采样数量
+                if word.context_shrink_level > 0:
+                    shrink_factors = [1.0, 0.5, 0.25]
+                    factor = shrink_factors[min(word.context_shrink_level, len(shrink_factors) - 1)] if word.context_shrink_level < 3 else 0.1
+                    actual_samples = max(1, int(Word.MAX_CONTEXT_SAMPLES * factor))
+                    sampled_context, _ = word.sample_diverse_context(max_samples=actual_samples)
+                    context_original = "\n\n".join([f"【上下文 {i+1}】\n{p}" for i, p in enumerate(sampled_context)])
+                else:
+                    context_original = word.get_context_str_for_surface_analysis(self.language)
                 
                 # 判断是否有已翻译的参考文本（新流程）
                 has_translation = len(word.context_translation) > 0
@@ -782,21 +982,45 @@ class LLM:
                         + "\n" + f"参考文本原文：\n{context_original}"
                     )
 
-                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
-                    [
-                        {
-                            "role": "system",
-                            "content": system_prompt,
+                # 【新增】使用 asyncio.wait_for 添加超时控制
+                try:
+                    error, usage, response_think, response_result, llm_request, llm_response = await asyncio.wait_for(
+                        self.do_request(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": system_prompt,
+                                },
+                                {
+                                    "role": "user",
+                                    "content": user_content,
+                                },
+                            ],
+                            LLM.SURFACE_ANALYSIS_CONFIG,
+                            retry,
+                            task_id=task_id,
+                        ),
+                        timeout=LLM.TASK_TIMEOUT_THRESHOLD  # 430秒超时
+                    )
+                except asyncio.TimeoutError:
+                    # 【超时处理】触发上下文限缩，重新采样
+                    elapsed = time_module.time() - start_time
+                    
+                    # 提升限缩级别（减少上下文采样数量）
+                    word.context_shrink_level += 1
+                    
+                    LogTable.print_llm_task(
+                        task_name="词义分析",
+                        word_surface=word.surface,
+                        status="warning",
+                        message=f"⏱️ 超时 ({elapsed:.0f}s > {LLM.TASK_TIMEOUT_THRESHOLD}s)，触发限缩: level {word.context_shrink_level}",
+                        elapsed_time=elapsed,
+                        extra_info={
+                            "限缩级别": word.context_shrink_level,
+                            "上下文长度": len(context_original),
                         },
-                        {
-                            "role": "user",
-                            "content": user_content,
-                        },
-                    ],
-                    LLM.SURFACE_ANALYSIS_CONFIG,
-                    retry,
-                    task_id=task_id,
-                )
+                    )
+                    raise Exception(f"任务超时 ({elapsed:.0f}s)，已触发上下文限缩 (level {word.context_shrink_level})")
 
                 # 检查错误
                 if error != None:
@@ -1167,21 +1391,51 @@ class LLM:
                         tracker.complete_task(task_id, success=True)
                     return
                 
-                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
-                    [
-                        {
-                            "role": "system",
-                            "content": self.prompt_context_translate,
+                # 【新增】使用 asyncio.wait_for 添加超时控制
+                try:
+                    error, usage, response_think, response_result, llm_request, llm_response = await asyncio.wait_for(
+                        self.do_request(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": self.prompt_context_translate,
+                                },
+                                {
+                                    "role": "user",
+                                    "content": f"参考上下文：\n{context_str}",
+                                },
+                            ],
+                            LLM.CONTEXT_TRANSLATE_CONFIG,
+                            retry,
+                            task_id=task_id,
+                        ),
+                        timeout=LLM.TASK_TIMEOUT_THRESHOLD  # 430秒超时
+                    )
+                except asyncio.TimeoutError:
+                    # 【超时处理】触发上下文限缩，重新采样
+                    elapsed = time_module.time() - start_time
+                    
+                    # 记录本次失败的上下文索引
+                    for idx in sampled_indices:
+                        word.failed_context_indices.add(idx)
+                    
+                    # 提升限缩级别（减少上下文采样数量）
+                    word.context_shrink_level += 1
+                    
+                    LogTable.print_llm_task(
+                        task_name="参考文本翻译",
+                        word_surface=word.surface,
+                        status="warning",
+                        message=f"⏱️ 超时 ({elapsed:.0f}s > {LLM.TASK_TIMEOUT_THRESHOLD}s)，触发限缩: level {word.context_shrink_level}",
+                        request_content=context_str[:200] + "..." if len(context_str) > 200 else context_str,
+                        elapsed_time=elapsed,
+                        extra_info={
+                            "限缩级别": word.context_shrink_level,
+                            "已排除索引": len(word.failed_context_indices),
+                            "采样索引": str(sampled_indices),
                         },
-                        {
-                            "role": "user",
-                            "content": f"参考上下文：\n{context_str}",
-                        },
-                    ],
-                    LLM.CONTEXT_TRANSLATE_CONFIG,
-                    retry,
-                    task_id=task_id,
-                )
+                    )
+                    raise Exception(f"任务超时 ({elapsed:.0f}s)，已触发上下文限缩 (level {word.context_shrink_level})")
 
                 if error != None:
                     # 【关键】检测敏感内容过滤错误，触发限缩策略

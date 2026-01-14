@@ -25,12 +25,37 @@ import shutil
 import threading
 import time
 import traceback
+import sys
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.status import Status
+
+
+# ==================== Windows VT100 支持 ====================
+def enable_windows_vt100():
+    """
+    在 Windows 上启用 VT100 转义序列支持
+    这是让 Rich Live 正确原地更新的关键！！
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # 获取标准输出句柄
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            # 获取当前控制台模式
+            mode = ctypes.c_ulong()
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            # 启用 ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004)
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
+
+# 在模块加载时启用
+enable_windows_vt100()
 
 
 class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
@@ -125,7 +150,8 @@ class LogHelper:
                     pass
             
             # ========== 控制台实例 ==========
-            # 使用 force_terminal=True 和 legacy_windows=False 来支持 Unicode
+            # 使用 force_terminal=True
+            # 配合 legacy_windows=False，强制使用 ANSI 转义序列（前提是 enable_windows_vt100 已成功）
             cls._console = Console(highlight=True, tab_size=4, force_terminal=True, legacy_windows=False)
             cls.console_highlight = cls._console
             cls.console_no_highlight = Console(highlight=False, tab_size=4, force_terminal=True, legacy_windows=False)
@@ -153,6 +179,7 @@ class LogHelper:
 
             # ========== 控制台日志实例 ==========
             console_handler = RichHandler(
+                console=cls._console,  # 【关键】复用同一个 Console 实例
                 markup=True,
                 show_path=False,
                 rich_tracebacks=False,
@@ -172,6 +199,13 @@ class LogHelper:
 
             cls._initialized = True
 
+    @classmethod
+    def get_console(cls) -> Console:
+        """获取全局唯一的 Console 实例"""
+        cls._ensure_init()
+        return cls._console
+
+    
     # ==================== 核心日志方法 ====================
 
     @classmethod
