@@ -509,7 +509,7 @@ BookTerm Gacha automates this process:
 
 **For users who just want to get started quickly:**
 
-1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTermGacha/releases)
+1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTerm-Gacha/releases)
 2. Extract the ZIP file to any folder
 3. Choose your LLM platform and get API key(s):
    - **NVIDIA Build** (Recommended): [build.nvidia.com](https://build.nvidia.com/) - DeepSeek V3.2 免费额度
@@ -694,7 +694,7 @@ If you encounter errors:
 
 ### Method 2: Clone Repository (For Developers & GPU Users)
 
-Remember to clone https://huggingface.co/neavo/keyword_gacha_multilingual_ner to "\BookTerm Gacha\resource\kg_ner_bf16" (Since “model.safetensors” is too large for GitHub)
+Remember to clone https://huggingface.co/neavo/keyword_gacha_multilingual_ner to "\BookTerm Gacha\resource\kg_ner_bf16" (Since "model.safetensors" is too large for GitHub)
 
 Choose this method if:
 - ✅ You have an NVIDIA GPU and want **faster processing** (3-10x speedup)
