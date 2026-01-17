@@ -43,6 +43,7 @@ from module.Text.TextHelper import TextHelper
 from module.LogHelper import LogHelper
 from module.LogTable import LogTable
 from module.TaskTracker import TaskTracker, get_current_tracker, set_current_tracker
+from module.ErrorLogger import ErrorLogger
 
 
 class LLM:
@@ -502,11 +503,6 @@ class LLM:
         except Exception as e:
             LogHelper.error(f"加载配置文件时发生错误 - {LogHelper.get_trackback(e)}")
 
-        try:
-            with open("prompt/prompt_surface_analysis_with_translation.txt", "r", encoding = "utf-8-sig") as reader:
-                self.prompt_surface_analysis_with_translation = reader.read().strip()
-        except Exception as e:
-            LogHelper.error(f"加载配置文件时发生错误 - {LogHelper.get_trackback(e)}")
 
         try:
             with open("prompt/prompt_surface_analysis_without_translation.txt", "r", encoding = "utf-8-sig") as reader:
@@ -580,6 +576,17 @@ class LLM:
         # 这对于多API Key轮询场景非常重要！
         concurrent_limit = max(1, self.max_concurrent_requests)
         frequency_limit = max(1, int(self.request_frequency_threshold))
+        
+        # 【针对 429 错误的优化】
+        # 如果 request_frequency_threshold 设置得很高（如 100），但实际 API 限制是 60 RPM
+        # 那么 aiolimiter 会允许每秒发 100 个，导致瞬间触发 429
+        # 因此，这里引入一个保守的 "每秒并发增量限制"
+        # 默认情况下，对于非 llama.cpp 接口，我们将频率限制在合理范围内（例如 5-10 RPS）
+        if self.request_frequency_threshold > 20 and "localhost" not in self.base_url and "127.0.0.1" not in self.base_url:
+             LogHelper.warning(f"[并发控制] 检测到高频请求设置 ({self.request_frequency_threshold} RPS)，自动降级至 10 RPS 以避免 429")
+             self.request_frequency_threshold = 10.0
+             frequency_limit = 10
+
         LogHelper.info(f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {frequency_limit} 次/秒")
         
         if self.request_frequency_threshold > 1:
@@ -699,6 +706,24 @@ class LLM:
         except Exception as e:
             error = e
             LogHelper.error(f"[LLM请求] 失败: {e}")
+            try:
+                ErrorLogger.log(
+                    error_type="LLMRequestError",
+                    message=str(e),
+                    context={
+                        "task_id": task_id,
+                        "platform_name": getattr(self.config, "platform_name", ""),
+                        "base_url": getattr(self, "base_url", ""),
+                        "model": getattr(self, "model_name", ""),
+                        "retry": bool(retry),
+                        "llm_request": llm_request,
+                        "llm_response": llm_response,
+                        "response_think": response_think,
+                        "response_result": response_result,
+                    },
+                )
+            except Exception:
+                pass
         
         return error, usage, response_think, response_result, llm_request, llm_response
 
@@ -918,7 +943,34 @@ class LLM:
                     raise Exception("返回结果错误（模型退化） ...")
 
                 # 反序列化 JSON
-                result = repair.loads(response_result)
+                try:
+                    # 尝试清理非 JSON 内容（有时模型会在 JSON 外输出废话）
+                    clean_json = response_result
+                    if "```json" in clean_json:
+                        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_json:
+                        clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                    
+                    # 尝试修复常见的 JSON 格式错误
+                    # 1. 修复未转义的换行符
+                    clean_json = clean_json.replace("\n", "\\n")
+                    # 2. 修复中文引号
+                    clean_json = clean_json.replace("“", '"').replace("”", '"')
+                    
+                    result = repair.loads(clean_json)
+                except Exception as e:
+                    LogHelper.warning(f"[JSON解析] 初次解析失败，尝试暴力修复: {e}")
+                    # 暴力提取 JSON 对象
+                    try:
+                        json_match = re.search(r"\{.*\}", response_result, re.DOTALL)
+                        if json_match:
+                            clean_json = json_match.group(0)
+                            result = repair.loads(clean_json)
+                        else:
+                            raise Exception("未找到有效的 JSON 对象")
+                    except Exception as e2:
+                        raise Exception(f"JSON 解析完全失败: {e2} | 原文: {response_result[:100]}...")
+
                 if not isinstance(result, dict) or result == {}:
                     raise Exception("返回结果错误（数据结构） ...")
 
@@ -1031,7 +1083,34 @@ class LLM:
                     raise Exception("返回结果错误（模型退化） ...")
 
                 # 反序列化 JSON
-                result = repair.loads(response_result)
+                try:
+                    # 尝试清理非 JSON 内容（有时模型会在 JSON 外输出废话）
+                    clean_json = response_result
+                    if "```json" in clean_json:
+                        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_json:
+                        clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                    
+                    # 尝试修复常见的 JSON 格式错误
+                    # 1. 修复未转义的换行符
+                    clean_json = clean_json.replace("\n", "\\n")
+                    # 2. 修复中文引号
+                    clean_json = clean_json.replace("“", '"').replace("”", '"')
+                    
+                    result = repair.loads(clean_json)
+                except Exception as e:
+                    LogHelper.warning(f"[JSON解析] 初次解析失败，尝试暴力修复: {e}")
+                    # 暴力提取 JSON 对象
+                    try:
+                        json_match = re.search(r"\{.*\}", response_result, re.DOTALL)
+                        if json_match:
+                            clean_json = json_match.group(0)
+                            result = repair.loads(clean_json)
+                        else:
+                            raise Exception("未找到有效的 JSON 对象")
+                    except Exception as e2:
+                        raise Exception(f"JSON 解析完全失败: {e2} | 原文: {response_result[:100]}...")
+
                 if not isinstance(result, dict) or result == {}:
                     raise Exception("返回结果错误（数据结构） ...")
 
@@ -1678,8 +1757,35 @@ class LLM:
                 if error is not None:
                     raise error
                 
-                # 解析结果
-                result = repair.loads(response_result)
+                # 反序列化 JSON
+                try:
+                    # 尝试清理非 JSON 内容（有时模型会在 JSON 外输出废话）
+                    clean_json = response_result
+                    if "```json" in clean_json:
+                        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_json:
+                        clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                    
+                    # 尝试修复常见的 JSON 格式错误
+                    # 1. 修复未转义的换行符
+                    clean_json = clean_json.replace("\n", "\\n")
+                    # 2. 修复中文引号
+                    clean_json = clean_json.replace("“", '"').replace("”", '"')
+                    
+                    result = repair.loads(clean_json)
+                except Exception as e:
+                    LogHelper.warning(f"[JSON解析] 初次解析失败，尝试暴力修复: {e}")
+                    # 暴力提取 JSON 对象
+                    try:
+                        json_match = re.search(r"\{.*\}", response_result, re.DOTALL)
+                        if json_match:
+                            clean_json = json_match.group(0)
+                            result = repair.loads(clean_json)
+                        else:
+                            raise Exception("未找到有效的 JSON 对象")
+                    except Exception as e2:
+                        raise Exception(f"JSON 解析完全失败: {e2} | 原文: {response_result[:100]}...")
+
                 if not isinstance(result, dict):
                     raise Exception("返回结果错误（数据结构）")
                 

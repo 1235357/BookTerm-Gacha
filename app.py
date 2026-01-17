@@ -501,6 +501,16 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
         # 重置 API 状态（每次启动时清除黑名单和轮询索引）
         LLM.reset_api_state()
 
+        try:
+            from module.ErrorLogger import ErrorLogger
+            ErrorLogger.configure(
+                enabled=getattr(config, "error_detail_log_enable", True),
+                max_chars=getattr(config, "error_detail_log_max_chars", 20000),
+                log_file=getattr(config, "error_detail_log_file", "log/error_detail.log"),
+            )
+        except Exception:
+            pass
+
         # 初始化 LLM 对象
         llm = LLM(config)
         llm.load_prompt()
