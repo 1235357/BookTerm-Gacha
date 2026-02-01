@@ -1,4 +1,5 @@
 import re
+from module.File.TextIO import read_text_lines_any_encoding
 
 class RENPY():
 
@@ -48,8 +49,7 @@ class RENPY():
         items: list[str] = []
         for abs_path in set(abs_paths):
             # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                lines = [line.rstrip() for line in reader.readlines()]
+            lines = [line.rstrip() for line in read_text_lines_any_encoding(abs_path)]
 
             for i, line in enumerate(lines):
                 results: list[str] = RENPY.RE_RENPY.findall(line)

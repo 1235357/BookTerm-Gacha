@@ -12,10 +12,19 @@ output/
 
 # 配置文件
 .env
+secrets/
 
 # 日志文件
 *.log
+log/
 
 # 临时文件
 *.tmp
 *.temp
+tmp.md
+
+# IDE和临时目录
+.codemap/
+widget/
+frontend/
+tmp/

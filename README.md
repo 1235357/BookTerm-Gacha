@@ -1,425 +1,3 @@
-# BookTerm Gacha
-
-An LLM-powered terminology extraction agent for books and story scripts.
-
-**Version:** `v0.2.0-Multi-Platform-API-Rotation`
-
-BookTerm Gacha reads your source text (EPUB/TXT/MD and more), extracts named entities with a local BERT NER model, then uses an OpenAI-compatible LLM API to **classify** and **translate / transliterate** the terms into a glossary you can feed into translation tools.
-
-This fork is heavily optimized for **Japanese → Chinese** name/place consistency (katakana handling, kana-residue checks, forced transliteration fallback), while still supporting **ZH/EN/JA/KO** input modes.
-
----
-
-## What you get
-
-For each detected term group, the tool generates:
-
-- `output/<input>_<group>_词典.json` — simple dictionary mapping (`src -> dst`)
-- `output/<input>_<group>_术语表.json` — glossary list with metadata (`src/dst/info`)
-- `output/<input>_<group>_galtransl.txt` — TSV for GalTransl-style import
-- `output/<input>_<group>_日志.txt` — human-readable audit log (context, translation, summary)
-
-And a post-run QA pass produces reports like:
-
-- `output/结果检查_假名残留.json`
-- `output/结果检查_相似度过高.json`
-- `output/结果检查_空翻译.json`
-- `output/结果检查_报告.json`
-
-> Note: Output filenames currently use Chinese group names (`角色`, `地点`) because the pipeline’s classification taxonomy is Chinese-first.
-
----
-
-## Project layout
-
-Key folders/files in this workspace:
-
-```
-BookTerm Gacha/
-  app.py                     # main entry (menu + pipeline)
-  config.json                 # runtime settings (multi-platform, thresholds)
-  version.txt
-
-  input/                      # put your books/scripts here
-  output/                     # generated glossary + QA reports
-  log/                        # runtime logs
-
-  model/
-    NER.py                    # BERT NER extraction
-    LLM.py                    # LLM agent (streaming, retry, rotation)
-    Word.py                   # term object + context sampling
-
-  module/
-    FileManager.py            # reads many formats; writes outputs
-    EnvChecker.py             # auto environment check/repair (source run)
-    ResultChecker.py          # QA checks
-    RubyCleaner.py            # removes Japanese ruby/furigana
-    TaskTracker.py            # persistent bottom progress panel
-
-  prompt/                     # LLM prompt templates (Chinese)
-  blacklist/                  # language-specific stopword lists
-
-  resource/
-    kg_ner_bf16/              # local NER model (token-classification)
-    llm_config/               # per-stage LLM generation configs
-```
-
----
-
-## Quick start (Windows)
-
-### Option A: Use the packaged EXE
-
-If you have a built release (`app.exe`), you typically only need to:
-
-1. Edit `config.json` (set platform + API keys).
-2. Put your files into `input/`.
-3. Run `app.exe`.
-
-> In PyInstaller builds, environment checks are skipped because dependencies are bundled.
-
-### Option B: Run from source (recommended for developers / GPU)
-
-Requirements:
-
-- Python **3.10+**
-- (Optional) NVIDIA GPU for faster NER
-
-Run:
-
-- `00_开发.bat` (Windows helper), or
-- `python app.py`
-
-On first run, `app.py` calls `module/EnvChecker.py` to:
-
-- validate Python version
-- detect GPU/CUDA
-- install missing packages using common mirrors
-- reinstall PyTorch with CUDA wheels when a GPU is present but PyTorch is CPU-only
-
----
-
-## Configuration (config.json)
-
-`config.json` is **the main runtime configuration**.
-
-This project uses a “value + comment” style for many fields:
-
-```json
-"count_threshold": [2, "...comment..." ]
-```
-
-Only the **first** element is read as the real value.
-
-### 1) Multi-platform LLM configuration
-
-BookTerm Gacha talks to LLMs via **OpenAI-compatible Chat Completions** (`openai.AsyncOpenAI`), and can switch between multiple platforms.
-
-Key fields:
-
-- `activate_platform`: the `id` of the active platform entry.
-- `platforms[]`: list of platform configs.
-  - `api_url`: base URL (OpenAI-compatible)
-  - `api_key`: **array** of keys (supports rotation)
-  - `model`: model name string
-  - `thinking`: hint flag (platform-specific; see below)
-
-Example (trimmed):
-
-```json
-{
-  "activate_platform": 1,
-  "platforms": [
-    {
-      "id": 1,
-      "name": "NVIDIA-DeepSeek-V3.2",
-      "api_url": "https://integrate.api.nvidia.com/v1",
-      "api_key": ["key1", "key2"],
-      "model": "deepseek-ai/deepseek-v3.2",
-      "thinking": true
-    }
-  ]
-}
-```
-
-### 2) API key rotation & blacklist
-
-If `api_key` contains multiple keys, the tool enables **round-robin rotation**:
-
-- Each request picks the next available key.
-- If a key hits a **provider ban / blacklist** (detected from `PermissionDenied` + keywords like `banned/suspended/blacklist`), the key is added to an in-memory blacklist and skipped.
-- If all keys are blacklisted, the run stops with a fatal error.
-
-This is designed for high-throughput batch runs where you want to:
-
-- avoid per-key rate ceilings
-- reduce total wall-clock time by distributing load
-
-### 3) Rate limiting & concurrency
-
-Two knobs control request pressure:
-
-- `request_frequency_threshold`: “how many requests per second we *send*”
-- `max_concurrent_requests`: “how many requests can be *in-flight* simultaneously”
-
-Implementation details (see `model/LLM.py`):
-
-- A semaphore caps concurrent in-flight requests.
-- An async rate limiter (`aiolimiter.AsyncLimiter`) caps the send rate.
-
-Why two limits? Because your average request latency matters:
-
-If average latency is $L$ seconds, and you send $R$ requests/sec, you’ll have about $R \cdot L$ requests in flight. A high $L$ with a high $R$ will explode concurrency unless capped.
-
-Practical tuning tips:
-
-- Getting `429 Too Many Requests`:
-  - lower `request_frequency_threshold`
-  - and/or lower `max_concurrent_requests`
-- You have many keys and want speed:
-  - keep `request_frequency_threshold` around `5–10`
-  - set `max_concurrent_requests` higher (e.g. `30–90`) *only if your provider and network can handle it*
-
-### 4) NER and filtering knobs
-
-These parameters are crucial to keep LLM calls affordable and improve quality.
-
-- `score_threshold` (default `0.60`)
-  - After NER, terms below this confidence are dropped.
-- `count_threshold` (default `2`)
-  - Terms with fewer occurrences are dropped.
-  - This saves a lot of LLM tokens on one-off noise.
-- `max_display_length` (default `32`)
-  - Filters out abnormal long “terms”.
-- `ner_target_types` (default `['PER', 'LOC']`)
-  - NER stage keeps only selected entity types.
-  - Including `ORG/PRD` increases coverage but can multiply LLM cost.
-
-### 5) Context sampling controls
-
-LLMs are only as good as the context you give them. This project implements **diverse context sampling** in `model/Word.py`:
-
-- `max_context_samples` (default `5` in config; loaded into `Word.MAX_CONTEXT_SAMPLES`)
-- `tokens_per_sample` (default `512` in config; loaded into `Word.TOKENS_PER_SAMPLE`)
-
-How it works:
-
-1. For each term, all lines containing the term are collected.
-2. The occurrences are split into $N$ evenly-spaced groups.
-3. From each group’s starting position, adjacent lines are aggregated until ~80% of the token budget.
-4. Each aggregated paragraph is emitted with a stable header `【上下文 i】`.
-
-This yields contexts from different parts of the book (first appearance, later usage, dialogue vs narration, etc.).
-
-### 6) Traditional Chinese output
-
-- `traditional_chinese_enable`: if `true`, output Chinese strings are converted using OpenCC (`s2tw`).
-
----
-
-## How the pipeline works (v0.2.0)
-
-The runtime workflow lives in `app.py`.
-
-### Stage 0 — Text ingestion & normalization
-
-`module/FileManager.py` reads files from `input/` (or a user-provided path) and normalizes lines:
-
-- Unicode normalization + fullwidth/halfwidth fixes (`module/Normalizer.py`)
-- whitespace cleanup
-- language filtering (keeps only lines containing characters of the selected language)
-
-Supported input formats include:
-
-- books: `.epub`, `.txt`, `.md`, `.xlsx`
-- scripts/subtitles: `.ass`, `.srt`, `.rpy`, `.trans`
-- json formats: KV-style JSON, message JSON
-
-### Stage 1 — NER (local BERT, GPU-friendly)
-
-`model/NER.py` uses Hugging Face Transformers `pipeline('token-classification')` with aggregation.
-
-Key techniques:
-
-- **Chunking to 512 tokens** so long books can be processed safely.
-- **bf16/fp16** on GPU when available (`is_torch_bf16_gpu_available`).
-- **Ruby/Furigana removal** (`module/RubyCleaner.py`) for Japanese sources.
-- **Stopword blacklist** (`blacklist/*.json`) to remove pronouns/particles/etc.
-- **Japanese-specific rule**: keep only candidates that contain kana (hiragana/katakana), because the main use case is katakana-style names that must be transliterated.
-
-The result is a list of candidate entities with confidence scores.
-
-### Stage 1.5 — Heuristic filtering
-
-In `app.py`:
-
-- merge duplicates by surface, keep max score
-- drop low-confidence by `score_threshold`
-- search per-term contexts; compute occurrence count
-- drop low-frequency by `count_threshold`
-- drop overly long “terms” by `max_display_length`
-
-These filters reduce LLM workload dramatically.
-
-### Stage 2 — LLM context translation (NEW workflow)
-
-For non-Chinese source languages, v0.2.0 forces a two-step strategy:
-
-1. **Translate sampled contexts into Simplified Chinese** (`context_translate_batch`).
-2. Use the translated context to improve the next stage’s semantic decisions.
-
-Hard rules in the translation prompt (see `prompt/prompt_context_translate.txt`):
-
-- keep `【上下文 N】` headers exactly
-- keep line alignment (no merging/splitting lines)
-- forbid copying kana/latin/hangeul into the Chinese output
-
-Robustness tactics:
-
-- per-task timeout with `asyncio.wait_for`
-- automatic context shrinking when timeouts or content filters happen
-
-### Stage 3 — LLM surface analysis (classification + final term translation)
-
-For each term, the LLM returns a JSON object with:
-
-- `summary` (Chinese)
-- `group` (fine-grained taxonomy)
-- `gender` (`男/女/无法判断`)
-- `translation` (final Chinese term)
-
-Then the code maps fine-grained types into output groups:
-
-- `角色` (Character) — includes `姓氏/名字/...`
-- `地点` (Location)
-
-Everything else is filtered out as “not target”.
-
-Quality gates (automatic retries):
-
-- strict kana residue detection (allows isolated onomatopoeia markers like `ッ`, `ヶ`)
-- hangeul residue detection for KO
-- degraded output detection (repetitive patterns)
-- “translation failed” similarity detection (Jaccard similarity ≥ 0.80)
-
-### Stage 4 — Automatic fix pass (problem terms only)
-
-After surface analysis, a third-stage fixer (`fix_translation_batch`) runs only on problematic entries:
-
-- empty translations
-- kana residue
-- similarity-too-high
-
-If fixing still fails, the tool uses a **forced transliteration fallback**:
-
-1. Convert to romaji via `pykakasi`
-2. Map romaji syllables to common Chinese phonetic chunks
-
-This ensures you always get a usable Chinese output, even under bad model behavior.
-
-### Stage 5 — Output & QA reports
-
-Finally, outputs are written per group, then `module/ResultChecker.py` generates QA reports.
-
----
-
-## LLM platform compatibility notes
-
-`model/LLM.py` automatically detects certain platforms and adjusts request shape:
-
-- Zhipu (bigmodel.cn): stream + thinking
-- NVIDIA Build DeepSeek: stream + `chat_template_kwargs.thinking`
-- ModelScope DeepSeek: stream + `enable_thinking`
-- OpenAI O-series: uses `max_completion_tokens` instead of `max_tokens`
-
-Everything else uses the standard OpenAI-compatible format.
-
-LLM generation parameters are primarily controlled by:
-
-- `resource/llm_config/context_translate_config.json`
-- `resource/llm_config/surface_analysis_config.json`
-- `resource/llm_config/api_test_config.json`
-
-> The per-platform `temperature/top_p/...` fields in `config.json` are currently not the primary source of sampling parameters; they are reserved / informational.
-
----
-
-## Troubleshooting
-
-### “No input found”
-
-- Put files into `input/`, or paste a path when prompted.
-
-### GPU is not used
-
-- NER uses GPU only if `torch.cuda.is_available()` is `True`.
-- If you have an NVIDIA GPU but PyTorch is CPU-only, the environment checker will try to reinstall CUDA wheels.
-
-### Too many requests / 429
-
-- Lower `request_frequency_threshold`.
-- Lower `max_concurrent_requests`.
-- Add more API keys and keep rotation enabled.
-
-### Timeouts
-
-- Increase `request_timeout`.
-- Increase `task_timeout_threshold` (per term; triggers context shrinking on timeout).
-
-### Content filter errors
-
-The tool automatically:
-
-- excludes the sampled context indices that triggered filtering
-- shrinks context sampling and retries
-
-If it still fails, consider lowering:
-
-- `max_context_samples`
-- `tokens_per_sample`
-
-### “All API keys are blacklisted”
-
-- Your provider rejected the keys (ban/suspension) and the tool stopped using them.
-- Replace keys, or switch `activate_platform` to another provider.
-
-### Output looks untranslated / too similar
-
-- Check `output/结果检查_相似度过高.json`.
-- Try a stronger model, or lower temperature in `resource/llm_config/*`.
-
----
-
-## Developer notes (build)
-
-Windows helpers:
-
-- `00_开发.bat` — run from source
-- `01_打包.bat` — PyInstaller build
-
-PyInstaller spec:
-
-- `BookTermGacha.spec` bundles Python deps into `dist/BookTermGacha/_internal`
-- `build_finish.py` copies runtime resources (prompts, blacklist, NER model, LLM configs)
-
----
-
-## Credits
-
-- Based on **KeywordGacha v0.13.1** (neavo) design and ecosystem.
-- Bundled NER model under `resource/kg_ner_bf16/` declares **Apache-2.0** in its model card.
-
----
-
-## About this README
-
-This README is generated from the current workspace code in `BookTerm Gacha/` (v0.2.0) and focuses on the actual implemented behavior:
-
-- three-stage LLM flow (translate → analyze → fix)
-- multi-platform OpenAI-compatible APIs
-- API key rotation + blacklist
-- diversified context sampling
-- strict QA checks and forced transliteration fallback
 <h1><p align="center">📚 BookTerm Gacha</p></h1>
 <p align="center"><strong>An LLM-Powered Agent for Automated Book Terminology Extraction</strong></p>
 <p align="center"><em>Multi-Platform LLM Support with API Key Rotation - Extract Character & Location Names from Japanese Literatures</em></p>
@@ -509,7 +87,7 @@ BookTerm Gacha automates this process:
 
 **For users who just want to get started quickly:**
 
-1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTerm-Gacha/releases)
+1. Download the latest release from [GitHub Releases](https://github.com/1235357/BookTermGacha/releases)
 2. Extract the ZIP file to any folder
 3. Choose your LLM platform and get API key(s):
    - **NVIDIA Build** (Recommended): [build.nvidia.com](https://build.nvidia.com/) - DeepSeek V3.2 免费额度
@@ -694,7 +272,7 @@ If you encounter errors:
 
 ### Method 2: Clone Repository (For Developers & GPU Users)
 
-Remember to clone https://huggingface.co/neavo/keyword_gacha_multilingual_ner to "\BookTerm Gacha\resource\kg_ner_bf16" (Since "model.safetensors" is too large for GitHub)
+Remember to clone https://huggingface.co/neavo/keyword_gacha_multilingual_ner to "\BookTerm Gacha\resource\kg_ner_bf16" (Since “model.safetensors” is too large for GitHub)
 
 Choose this method if:
 - ✅ You have an NVIDIA GPU and want **faster processing** (3-10x speedup)
@@ -952,6 +530,14 @@ The `config.json` file controls all settings. Here's a detailed explanation:
     "tokens_per_sample": [512, "每段最大 token 数"],
     "ner_target_types": [["PER", "LOC"], "提取的实体类型"],
     "request_timeout": [1800, "API 超时时间(秒)"],
+    "stream_first_chunk_timeout_seconds": [600, "首包等待超时(秒)：从“发”到“思/收”"],
+    "stream_stall_timeout_seconds": [120, "流式卡住超时(秒)：已有 chunk 但长时间无新数据"],
+    "stream_retry_attempts": [3, "流式重试次数(包含首次尝试)"],
+    "stream_retry_backoff_seconds": [2, "流式重试退避基准秒数(线性退避)"],
+    "llamacpp_auto_detect_enable": [true, "是否自动检测 llama.cpp(/slots) 并自动设置频率阈值"],
+    "request_frequency_auto_downgrade_enable": [false, "是否启用高频请求自动降级(避免429)"],
+    "request_frequency_auto_downgrade_threshold": [20, "触发自动降级的频率阈值"],
+    "request_frequency_auto_downgrade_to": [10, "自动降级后的频率阈值"],
     "request_frequency_threshold": [10, "每秒最大请求数"],
     "max_concurrent_requests": [90, "最大并发请求数"],
     "traditional_chinese_enable": [false, "繁体中文输出"]
@@ -962,6 +548,8 @@ The `config.json` file controls all settings. Here's a detailed explanation:
 |---------|-------------|---------|--------|
 | `count_threshold` | 词语最少出现次数 | `2` | 保持默认 |
 | `score_threshold` | NER 置信度阈值 | `0.60` | `0.50-0.70` |
+| `stream_first_chunk_timeout_seconds` | 首包等待超时 | `600` | 服务波动大可调大 |
+| `stream_stall_timeout_seconds` | 流式卡住超时 | `120` | 60-180 |
 | `request_frequency_threshold` | 每秒请求数上限 | `10` | 多 Key 时设为 `5-10` |
 | `max_concurrent_requests` | 最大并发数 | `90` | 多 Key 时可增加 |
 | `traditional_chinese_enable` | 繁体中文 | `false` | 台湾/香港用户设为 `true` |
@@ -1218,20 +806,20 @@ BookTerm Gacha uses a **4-stage pipeline**:
 │                                                             │
 │                         ↓                                   │
 │                                                             │
-│  Stage 2: Context Sampling                                  │
-│  ────────────────────────                                   │
-│  • For each entity, finds paragraphs where it appears       │
-│  • Samples N context paragraphs (configurable)              │
-│  • Prepares context for LLM analysis                        │
+│  Stage 2: Context Sampling & Translation (LLM)              │
+│  ───────────────────────────────────────────                │
+│  • For each entity, samples N context paragraphs            │
+│  • LLM translates sampled context for better understanding  │
+│  • Line count mismatch is tolerated (quality > alignment)   │
 │                                                             │
 │                         ↓                                   │
 │                                                             │
-│  Stage 3: LLM Analysis (Zhipu GLM)                          │
-│  ─────────────────────────────────                          │
-│  • Sends entity + context to LLM                            │
+│  Stage 3: LLM Analysis & Term Generation                    │
+│  ─────────────────────────────────────                      │
+│  • Sends entity + original context (+ translated context)   │
 │  • LLM returns: translation, gender, category, summary      │
 │  • Validation: Checks for kana residue, degradation         │
-│  • Retry logic: Up to 8 retries with fallback               │
+│  • Rolling retry: failed items are re-queued immediately    │
 │                                                             │
 │                         ↓                                   │
 │                                                             │

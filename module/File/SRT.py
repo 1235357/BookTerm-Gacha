@@ -1,4 +1,5 @@
 import re
+from module.File.TextIO import read_text_lines_any_encoding
 
 class SRT():
 
@@ -22,24 +23,15 @@ class SRT():
         items: list[str] = []
         for abs_path in set(abs_paths):
             # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                chunks = re.split(r"\n{2,}", reader.read().strip())
-                for chunk in chunks:
-                    lines = [line.strip() for line in chunk.splitlines()]
+            text = "\n".join(read_text_lines_any_encoding(abs_path)).strip()
+            chunks = re.split(r"\n{2,}", text)
+            for chunk in chunks:
+                lines = [line.strip() for line in chunk.splitlines()]
 
-                    # isdecimal
-                    # 字符串中的字符是否全是十进制数字。也就是说，只有那些在数字系统中被认为是“基本”的数字字符（0-9）才会返回 True。
-                    # isdigit
-                    # 字符串中的字符是否都是数字字符。它不仅检查十进制数字，还包括其他可以表示数字的字符，如数字上标、罗马数字、圆圈数字等。
-                    # isnumeric
-                    # 字符串中的字符是否表示任何类型的数字，包括整数、分数、数字字符的变种（比如上标、下标）以及其他可以被认为是数字的字符（如中文数字）。
+                if len(lines) < 3 or not lines[0].isdecimal():
+                    continue
 
-                    # 格式校验
-                    if len(lines) < 3 or not lines[0].isdecimal():
-                        continue
-
-                    # 添加数据
-                    if lines[-1] != "":
-                        items.append("\n".join(lines[2:])) # 如有多行文本则用换行符拼接
+                if lines[-1] != "":
+                    items.append("\n".join(lines[2:]))
 
         return items

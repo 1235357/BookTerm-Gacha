@@ -1,4 +1,5 @@
 import json
+from module.File.TextIO import read_text_lines_any_encoding
 
 class MESSAGEJSON():
 
@@ -23,22 +24,20 @@ class MESSAGEJSON():
         items: list[str] = []
         for abs_path in set(abs_paths):
             # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                json_data: list[dict[str, dict]] = json.load(reader)
+            json_data: list[dict[str, dict]] = json.loads("\n".join(read_text_lines_any_encoding(abs_path)))
 
-                # 格式校验
-                if not isinstance(json_data, list):
+            if not isinstance(json_data, list):
+                continue
+
+            for v in json_data:
+                if not isinstance(v, dict) or "message" not in v:
                     continue
 
-                for v in json_data:
-                    if not isinstance(v, dict) or "message" not in v:
-                        continue
-
-                    if "name" not in v:
-                        items.append(v.get("message", ""))
-                    elif isinstance(v.get("name"), str):
-                        items.append(f"【{v.get("name")}】{v.get("message", "")}")
-                    else:
-                        items.append(v.get("message", ""))
+                if "name" not in v:
+                    items.append(v.get("message", ""))
+                elif isinstance(v.get("name"), str):
+                    items.append(f"【{v.get('name')}】{v.get('message', '')}")
+                else:
+                    items.append(v.get("message", ""))
 
         return items

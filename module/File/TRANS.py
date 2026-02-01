@@ -1,4 +1,5 @@
 import json
+from module.File.TextIO import read_text_lines_any_encoding
 
 class TRANS():
 
@@ -10,24 +11,18 @@ class TRANS():
         items: list[str] = []
         for abs_path in set(abs_paths):
             # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                json_data = json.load(reader)
+            json_data = json.loads("\n".join(read_text_lines_any_encoding(abs_path)))
 
-                # 有效性校验
-                if not isinstance(json_data, dict):
-                    continue
+            if not isinstance(json_data, dict):
+                continue
 
-                # 获取项目信息
-                project: dict = json_data.get("project", {})
+            project: dict = json_data.get("project", {})
 
-                # 处理数据
-                for path, entry in project.get("files", {}).items():
-                    for data in entry.get("data", []):
-                        # 有效性校验
-                        if not isinstance(data, list) or len(data) == 0 or not isinstance(data[0], str):
-                            continue
+            for path, entry in project.get("files", {}).items():
+                for data in entry.get("data", []):
+                    if not isinstance(data, list) or len(data) == 0 or not isinstance(data[0], str):
+                        continue
 
-                        # 添加数据
-                        items.append(data[0])
+                    items.append(data[0])
 
         return items

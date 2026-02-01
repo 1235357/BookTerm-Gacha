@@ -515,7 +515,7 @@ class NER:
         return line, surfaces
 
     # 查找实体词语
-    def search_for_entity(self, input_lines: list[str], names: dict, nicknames: dict, language: int) -> tuple[list, dict]:
+    def search_for_entity(self, input_lines: list[str], names: dict, nicknames: dict, language: int, progress_cb = None) -> tuple[list, dict]:
         words = []
 
         if language == NER.Language.JA:
@@ -596,6 +596,11 @@ class NER:
 
                 i = i + 1
                 progress.update(pid, advance = 1, total = len(chunks))
+                if callable(progress_cb):
+                    try:
+                        progress_cb({"kind": "ner_chunks", "current": i, "total": len(chunks)})
+                    except Exception:
+                        pass
 
         # 打印通过模式匹配抓取的角色实体
         LogHelper.print("")

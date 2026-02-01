@@ -25,6 +25,8 @@ import re
 import asyncio
 import threading
 import urllib.request
+import time
+import random
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Optional
@@ -111,7 +113,7 @@ class LLM:
     API_KEY_INDEX: int = 0
     
     # 类级别变量 - API Key 黑名单（存储被封禁的 Key）
-    BLACKLISTED_KEYS: set[str] = set()
+    BLACKLISTED_KEYS: dict[str, float] = {}
     
     # 类线程锁
     KEY_LOCK: threading.Lock = threading.Lock()
@@ -144,23 +146,52 @@ class LLM:
         LogHelper.debug("[API状态] 已重置 Key 索引和黑名单")
     
     @classmethod
-    def add_to_blacklist(cls, key: str) -> None:
-        """将 Key 加入黑名单"""
+    def add_to_blacklist(cls, key: str, ttl_seconds: float | None = None) -> None:
         with cls.KEY_LOCK:
-            cls.BLACKLISTED_KEYS.add(key)
-            LogHelper.warning(f"[API黑名单] Key 已被加入黑名单: {key[:20]}...")
+            ttl = 3600.0 if ttl_seconds is None else float(ttl_seconds)
+            ttl = max(1.0, ttl)
+            cls.BLACKLISTED_KEYS[key] = time.time() + ttl
+            LogHelper.warning(f"[API黑名单] Key 已被加入黑名单: {key[:20]}... (ttl={int(ttl)}s)")
     
     @classmethod
     def is_blacklisted(cls, key: str) -> bool:
         """检查 Key 是否在黑名单中"""
         with cls.KEY_LOCK:
-            return key in cls.BLACKLISTED_KEYS
+            exp = cls.BLACKLISTED_KEYS.get(key)
+            if exp is None:
+                return False
+            if time.time() >= exp:
+                try:
+                    del cls.BLACKLISTED_KEYS[key]
+                except Exception:
+                    pass
+                return False
+            return True
     
     @classmethod
     def get_available_key_count(cls, keys: list[str]) -> int:
         """获取可用 Key 数量"""
         with cls.KEY_LOCK:
+            now = time.time()
+            expired = [k for k, exp in cls.BLACKLISTED_KEYS.items() if now >= exp]
+            for k in expired:
+                try:
+                    del cls.BLACKLISTED_KEYS[k]
+                except Exception:
+                    pass
             return sum(1 for k in keys if k not in cls.BLACKLISTED_KEYS)
+
+    @classmethod
+    def get_blacklisted_key_count(cls) -> int:
+        with cls.KEY_LOCK:
+            now = time.time()
+            expired = [k for k, exp in cls.BLACKLISTED_KEYS.items() if now >= exp]
+            for k in expired:
+                try:
+                    del cls.BLACKLISTED_KEYS[k]
+                except Exception:
+                    pass
+            return len(cls.BLACKLISTED_KEYS)
     
     @classmethod
     def get_key(cls, keys: list[str]) -> str:
@@ -201,6 +232,7 @@ class LLM:
     # ==================== 初始化 ====================
 
     def __init__(self, config: SimpleNamespace) -> None:
+        self.config = config
         # 支持多 API Key（兼容旧配置）
         api_key = config.api_key
         if isinstance(api_key, list):
@@ -216,6 +248,12 @@ class LLM:
         self.request_frequency_threshold = config.request_frequency_threshold
         # 最大并发请求数（用于控制并发上限，解决 429 问题）
         self.max_concurrent_requests = getattr(config, 'max_concurrent_requests', 5)
+        first_chunk_timeout_seconds = int(getattr(config, "stream_first_chunk_timeout_seconds", 600) or 600)
+        stall_timeout_seconds = int(getattr(config, "stream_stall_timeout_seconds", 120) or 120)
+        self.stream_first_chunk_timeout_seconds = max(1, first_chunk_timeout_seconds)
+        self.stream_stall_timeout_seconds = max(1, stall_timeout_seconds)
+        self.stream_retry_attempts = max(1, int(getattr(config, "stream_retry_attempts", 3) or 3))
+        self.stream_retry_backoff_seconds = max(0, int(getattr(config, "stream_retry_backoff_seconds", 2) or 2))
 
         # 初始化工具
         self.kakasi = pykakasi.kakasi()
@@ -237,6 +275,53 @@ class LLM:
         # 打印多 Key 信息
         if len(self.api_keys) > 1:
             LogHelper.info(f"[多API轮询] 检测到 {len(self.api_keys)} 个 API Key，已启用轮询机制")
+        
+        self._multi_key_per_key_limiter_enable = False
+        self._per_key_limiters: dict[str, AsyncLimiter] = {}
+        self._per_key_limiter_rpm: float = 1.0
+        self._key_last_used_at: dict[str, float] = {}
+        self.runtime_stats = {
+            "requests_started": 0,
+            "requests_succeeded": 0,
+            "requests_failed": 0,
+            "semaphore_wait_seconds": 0.0,
+            "global_limiter_wait_seconds": 0.0,
+            "per_key_limiter_wait_seconds": 0.0,
+            "errors_by_kind": {},
+            "last_error": "",
+            "last_error_kind": "",
+        }
+
+    def apply_runtime_config(self, config: SimpleNamespace) -> None:
+        self.config = config
+        api_key = config.api_key
+        if isinstance(api_key, list):
+            self.api_keys = api_key
+            self.api_key = api_key[0] if api_key else ""
+        else:
+            self.api_keys = [api_key] if api_key else []
+            self.api_key = api_key or ""
+
+        self.base_url = config.base_url
+        self.model_name = config.model_name
+        self.request_timeout = config.request_timeout
+        self.request_frequency_threshold = config.request_frequency_threshold
+        self.max_concurrent_requests = getattr(config, "max_concurrent_requests", 0)
+
+        first_chunk_timeout_seconds = int(getattr(config, "stream_first_chunk_timeout_seconds", 600) or 600)
+        stall_timeout_seconds = int(getattr(config, "stream_stall_timeout_seconds", 120) or 120)
+        self.stream_first_chunk_timeout_seconds = max(1, first_chunk_timeout_seconds)
+        self.stream_stall_timeout_seconds = max(1, stall_timeout_seconds)
+        self.stream_retry_attempts = max(1, int(getattr(config, "stream_retry_attempts", 3) or 3))
+        self.stream_retry_backoff_seconds = max(0, int(getattr(config, "stream_retry_backoff_seconds", 2) or 2))
+
+        self._clients.clear()
+        self._stream_clients.clear()
+        self.client = self._create_client()
+        self.stream_client = self._create_client_no_timeout()
+        self._platform_info = None
+
+        self.set_request_limiter()
 
     # ==================== 客户端创建（借鉴 TaskRequester.py） ====================
 
@@ -445,6 +530,20 @@ class LLM:
         
         return False
 
+    @staticmethod
+    def _calc_kana_ratio(text: str) -> float:
+        if not text:
+            return 0.0
+        kana = 0
+        total = 0
+        for char in text:
+            if char.isspace():
+                continue
+            total += 1
+            if TextHelper.JA.hiragana(char) or TextHelper.JA.katakana(char):
+                kana += 1
+        return kana / total if total > 0 else 0.0
+
     # 检测文本是否包含韩文（使用精确字符集）
     @staticmethod
     def contains_korean(text: str) -> bool:
@@ -480,6 +579,203 @@ class LLM:
         union = len(set_src | set_dst)
         intersection = len(set_src & set_dst)
         return intersection / union if union > 0 else 0.0
+
+    @staticmethod
+    def _split_expected_context_blocks(context_str: str) -> tuple[list[str], list[int]]:
+        if not context_str:
+            return [], []
+        lines = [line.rstrip("\r\n") for line in context_str.splitlines()]
+        headers: list[str] = []
+        counts: list[int] = []
+        current_count = 0
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(r"^【\s*上下文\s*(\d+)\s*】$", s)
+            if m:
+                if headers:
+                    counts.append(current_count)
+                headers.append(s)
+                current_count = 0
+            else:
+                if headers:
+                    current_count += 1
+        if headers:
+            counts.append(current_count)
+        return headers, counts
+
+    @staticmethod
+    def _try_extract_fenced_block(text: str) -> str:
+        if "```" not in (text or ""):
+            return text or ""
+        blocks = re.findall(r"```(?:\w+)?\s*([\s\S]*?)\s*```", text)
+        for b in blocks:
+            if "上下文" in b:
+                return b
+        return text or ""
+
+    @staticmethod
+    def _extract_context_blocks(text: str) -> list[tuple[int | None, str]]:
+        if not text:
+            return []
+        pattern = re.compile(r"(?:【|\[|\(|（)\s*(?:参考\s*)?(?:上下文|上文|context)\s*(\d+)\s*(?:】|\]|\)|）)", flags=re.IGNORECASE)
+        matches = list(pattern.finditer(text))
+        if not matches:
+            return []
+        blocks: list[tuple[int | None, str]] = []
+        for idx, m in enumerate(matches):
+            start = m.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            num: int | None = None
+            try:
+                num = int(m.group(1))
+            except Exception:
+                num = None
+            blocks.append((num, text[start:end]))
+        return blocks
+
+    @staticmethod
+    def _concat_text_lines(a: str, b: str) -> str:
+        a = (a or "").strip()
+        b = (b or "").strip()
+        if not a:
+            return b
+        if not b:
+            return a
+        if a[-1].isascii() and a[-1].isalnum() and b[0].isascii() and b[0].isalnum():
+            return f"{a} {b}"
+        return f"{a}{b}"
+
+    @staticmethod
+    def _merge_excess_lines(lines: list[str], expected_count: int) -> list[str]:
+        cleaned = [v.strip() for v in (lines or []) if isinstance(v, str) and v.strip()]
+        if expected_count <= 0:
+            return []
+        if len(cleaned) <= expected_count:
+            return cleaned
+        if expected_count == 1:
+            return ["".join(cleaned)]
+
+        end_punct = set("。！？!?…」』”")
+        start_punct = set("，,、.．:：;；)）]】}」』”")
+
+        out: list[str] = []
+        for i, cur in enumerate(cleaned):
+            if not out:
+                out.append(cur)
+                continue
+
+            remaining_after = len(cleaned) - (i + 1)
+            slots_after = expected_count - (len(out) + 1)
+            must_open_new = remaining_after == slots_after
+
+            prev = out[-1]
+            need_merge_somewhere = len(out) + remaining_after + 1 > expected_count
+            looks_boundary = bool(prev) and (prev[-1] in end_punct) and (cur[:1] not in start_punct)
+
+            if must_open_new:
+                out.append(cur)
+            elif need_merge_somewhere and not looks_boundary:
+                out[-1] = LLM._concat_text_lines(out[-1], cur)
+            else:
+                out.append(cur)
+
+        while len(out) > expected_count:
+            out[-2] = LLM._concat_text_lines(out[-2], out[-1])
+            out.pop()
+
+        return out
+
+    @staticmethod
+    def parse_context_translate_output(context_str: str, response_result: str) -> tuple[list[str], dict]:
+        original_lines = [line.strip() for line in (context_str or "").splitlines() if line.strip()]
+        expected_headers, expected_counts = LLM._split_expected_context_blocks(context_str or "")
+        expected_contexts = len(expected_headers)
+
+        raw = (response_result or "").strip()
+        raw = LLM._try_extract_fenced_block(raw).strip()
+
+        if expected_contexts <= 0:
+            return [line.strip() for line in raw.splitlines() if line.strip()], {"mode": "no_expected"}
+
+        blocks = LLM._extract_context_blocks(raw)
+        if not blocks:
+            lines = [line.strip() for line in raw.splitlines() if line.strip()]
+            mode = "fallback_lines_equal" if len(lines) == len(original_lines) else "fallback_no_blocks"
+            return lines, {"mode": mode, "expected_lines": len(original_lines), "found_lines": len(lines)}
+
+        blocks_by_num: dict[int, str] = {}
+        blocks_in_order: list[str] = []
+        for num, content in blocks:
+            blocks_in_order.append(content)
+            if isinstance(num, int) and num not in blocks_by_num:
+                blocks_by_num[num] = content
+
+        chosen_contents: list[str] = []
+        chosen_from: list[str] = []
+        missing_contexts: list[int] = []
+        for i in range(expected_contexts):
+            num = i + 1
+            if num in blocks_by_num:
+                chosen_contents.append(blocks_by_num[num])
+                chosen_from.append("number")
+                continue
+            if len(blocks_in_order) > i:
+                chosen_contents.append(blocks_in_order[i])
+                chosen_from.append("order")
+                continue
+            chosen_contents.append("")
+            chosen_from.append("missing")
+            missing_contexts.append(num)
+
+        if all(v == "number" for v in chosen_from):
+            mode = "by_number"
+        elif any(v == "number" for v in chosen_from):
+            mode = "by_number_partial"
+        elif any(v == "order" for v in chosen_from):
+            mode = "by_order_partial"
+        else:
+            mode = "empty"
+
+        out_lines: list[str] = []
+        detail: dict = {
+            "mode": mode,
+            "expected_contexts": expected_contexts,
+            "found_contexts": len(blocks_in_order),
+            "missing_contexts": missing_contexts,
+        }
+        for idx, (header, expected_line_count, content) in enumerate(zip(expected_headers, expected_counts, chosen_contents), start=1):
+            content_lines_raw = [line.strip() for line in (content or "").splitlines() if line.strip()]
+            content_lines = content_lines_raw
+            if len(content_lines) != expected_line_count and expected_line_count > 0 and len(content_lines) > expected_line_count:
+                content_lines = LLM._merge_excess_lines(content_lines, expected_line_count)
+                if len(content_lines) == expected_line_count:
+                    fixed = detail.get("fixed") if isinstance(detail.get("fixed"), list) else []
+                    fixed.append(
+                        {
+                            "context_index": idx,
+                            "expected": expected_line_count,
+                            "raw": len(content_lines_raw),
+                            "merged": len(content_lines),
+                        }
+                    )
+                    detail["fixed"] = fixed
+
+            if expected_line_count > 0 and len(content_lines) != expected_line_count:
+                mismatches = detail.get("mismatches") if isinstance(detail.get("mismatches"), list) else []
+                mismatches.append(
+                    {
+                        "context_index": idx,
+                        "expected": expected_line_count,
+                        "actual": len(content_lines),
+                    }
+                )
+                detail["mismatches"] = mismatches
+            out_lines.append(header)
+            out_lines.extend(content_lines)
+
+        return out_lines, detail
 
     # ==================== 客户端方法（向后兼容） ====================
 
@@ -545,13 +841,22 @@ class LLM:
 
     # 设置请求限制器
     def set_request_limiter(self) -> None:
+        auto_freq_downgrade_enable = bool(getattr(self.config, "request_frequency_auto_downgrade_enable", False))
+        auto_freq_downgrade_threshold = float(getattr(self.config, "request_frequency_auto_downgrade_threshold", 20))
+        auto_freq_downgrade_to = float(getattr(self.config, "request_frequency_auto_downgrade_to", 10))
+        auto_llamacpp_detect_enable = bool(getattr(self.config, "llamacpp_auto_detect_enable", True))
+        unlimited_concurrency_threshold = int(getattr(self.config, "unlimited_concurrency_threshold", 65536) or 65536)
+        multi_key_default_enable = bool(getattr(self.config, "multi_key_default_enable", True))
+        multi_key_default_per_key_rpm = float(getattr(self.config, "multi_key_default_per_key_rpm", 1) or 1)
+
         # 获取 llama.cpp 响应数据
-        try:
-            response_json = None
-            with urllib.request.urlopen(f"{re.sub(r"/v1$", "", self.base_url)}/slots") as reader:
-                response_json = repair.load(reader)
-        except Exception:
-            LogHelper.debug("无法获取 [green]llama.cpp[/] 响应数据 ...")
+        response_json = None
+        if auto_llamacpp_detect_enable:
+            try:
+                with urllib.request.urlopen(f"{re.sub(r"/v1$", "", self.base_url)}/slots") as reader:
+                    response_json = repair.load(reader)
+            except Exception:
+                LogHelper.debug("无法获取 [green]llama.cpp[/] 响应数据 ...")
 
         # 如果响应数据有效，则是 llama.cpp 接口
         if isinstance(response_json, list) and len(response_json) > 0:
@@ -574,7 +879,26 @@ class LLM:
         # 意味着：每秒发10个请求，但如果每个请求需要9秒返回，那么第9秒时就会有90个请求同时在飞行
         # 
         # 这对于多API Key轮询场景非常重要！
-        concurrent_limit = max(1, self.max_concurrent_requests)
+        if int(getattr(self, "max_concurrent_requests", 0) or 0) > 0:
+            concurrent_limit = int(self.max_concurrent_requests)
+        else:
+            concurrent_limit = unlimited_concurrency_threshold
+
+        key_count = len(self.api_keys)
+        is_llamacpp = isinstance(response_json, list) and len(response_json) > 0
+        if multi_key_default_enable and (not is_llamacpp) and key_count > 1:
+            per_key_rpm = max(0.001, float(multi_key_default_per_key_rpm))
+            total_rpm = per_key_rpm * key_count
+            self._multi_key_per_key_limiter_enable = True
+            self._per_key_limiters = {}
+            self._per_key_limiter_rpm = per_key_rpm
+            self.semaphore = asyncio.Semaphore(concurrent_limit)
+            self.async_limiter = AsyncLimiter(max_rate=total_rpm, time_period=60)
+            LogHelper.info(
+                f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {total_rpm:.2f} 次/分钟（每Key {per_key_rpm:.2f} 次/分钟）"
+            )
+            return
+
         frequency_limit = max(1, int(self.request_frequency_threshold))
         
         # 【针对 429 错误的优化】
@@ -582,10 +906,10 @@ class LLM:
         # 那么 aiolimiter 会允许每秒发 100 个，导致瞬间触发 429
         # 因此，这里引入一个保守的 "每秒并发增量限制"
         # 默认情况下，对于非 llama.cpp 接口，我们将频率限制在合理范围内（例如 5-10 RPS）
-        if self.request_frequency_threshold > 20 and "localhost" not in self.base_url and "127.0.0.1" not in self.base_url:
-             LogHelper.warning(f"[并发控制] 检测到高频请求设置 ({self.request_frequency_threshold} RPS)，自动降级至 10 RPS 以避免 429")
-             self.request_frequency_threshold = 10.0
-             frequency_limit = 10
+        if auto_freq_downgrade_enable and self.request_frequency_threshold > auto_freq_downgrade_threshold and "localhost" not in self.base_url and "127.0.0.1" not in self.base_url:
+             LogHelper.warning(f"[并发控制] 高频请求 ({self.request_frequency_threshold} RPS)，自动降级至 {auto_freq_downgrade_to} RPS")
+             self.request_frequency_threshold = float(auto_freq_downgrade_to)
+             frequency_limit = max(1, int(self.request_frequency_threshold))
 
         LogHelper.info(f"[并发控制] 最大并发: {concurrent_limit} | 频率限制: {frequency_limit} 次/秒")
         
@@ -600,6 +924,150 @@ class LLM:
             self.async_limiter = AsyncLimiter(max_rate = 1, time_period = 1)
 
     # ==================== 核心请求方法（完全重写，参照 TaskRequester.py） ====================
+
+    def _get_per_key_limiter(self, api_key: str) -> AsyncLimiter | None:
+        if not getattr(self, "_multi_key_per_key_limiter_enable", False):
+            return None
+        if not api_key or api_key == "no_key_required":
+            return None
+        limiter = getattr(self, "_per_key_limiters", None)
+        if not isinstance(limiter, dict):
+            self._per_key_limiters = {}
+            limiter = self._per_key_limiters
+        if api_key not in limiter:
+            per_key_rpm = max(0.001, float(getattr(self, "_per_key_limiter_rpm", 1.0) or 1.0))
+            limiter[api_key] = AsyncLimiter(max_rate=per_key_rpm, time_period=60)
+        return limiter[api_key]
+
+    def _get_worker_count(self, total: int) -> int:
+        total = max(1, int(total))
+        max_concurrent = int(getattr(self, "max_concurrent_requests", 0) or 0)
+        if max_concurrent > 0:
+            return min(max_concurrent, total)
+        cap = int(getattr(self.config, "unlimited_worker_count_cap", 1000) or 1000)
+        cap = max(1, cap)
+
+        key_count = 0
+        available_keys = 0
+        try:
+            key_count = len(self.api_keys) if isinstance(getattr(self, "api_keys", None), list) else 0
+            available_keys = LLM.get_available_key_count(self.api_keys) if getattr(self, "api_keys", None) else 0
+        except Exception:
+            key_count = 0
+            available_keys = 0
+
+        if bool(getattr(self, "_multi_key_per_key_limiter_enable", False)) and key_count > 1:
+            base = max(8, int(max(available_keys, 1) * 2))
+        else:
+            base = 32
+
+        return min(total, cap, max(1, base))
+
+    def _classify_exception(self, e: Exception) -> str:
+        msg = str(e).lower()
+        if "429" in msg or "rate limit" in msg or "ratelimit" in msg:
+            return "rate_limit"
+        if "timeout" in msg or "timed out" in msg or "首包超时" in msg or "流式响应超时" in msg or "请求超时" in msg or "任务超时" in msg:
+            return "timeout"
+        if "json" in msg or "解析" in msg or "数据结构" in msg:
+            return "parse"
+        if "相似度" in msg or "翻译失效" in msg:
+            return "similarity"
+        if "假名残留" in msg or "韩文残留" in msg or "korean" in msg or "kana" in msg:
+            return "language_residue"
+        if "permission" in msg or "denied" in msg or "banned" in msg or "blacklist" in msg or "prohibited" in msg:
+            return "permission"
+        return "other"
+
+    def _record_error(self, kind: str, e: Exception) -> None:
+        try:
+            self.runtime_stats["last_error"] = str(e)
+            self.runtime_stats["last_error_kind"] = kind
+            d = self.runtime_stats.get("errors_by_kind", {})
+            d[kind] = int(d.get(kind, 0)) + 1
+            self.runtime_stats["errors_by_kind"] = d
+        except Exception:
+            return
+
+    def _compute_retry_delay_seconds(self, e: Exception, attempt: int) -> float:
+        base = float(getattr(self.config, "task_retry_backoff_base_seconds", 2) or 2)
+        base_timeout = float(getattr(self.config, "task_retry_backoff_timeout_seconds", 8) or 8)
+        base_rate = float(getattr(self.config, "task_retry_backoff_rate_limit_seconds", 15) or 15)
+        max_delay = float(getattr(self.config, "task_retry_backoff_max_seconds", 120) or 120)
+        jitter_ratio = float(getattr(self.config, "task_retry_jitter_ratio", 0.15) or 0.15)
+        jitter_ratio = max(0.0, min(1.0, jitter_ratio))
+
+        kind = self._classify_exception(e)
+        if kind == "rate_limit":
+            base_use = base_rate
+        elif kind == "timeout":
+            base_use = base_timeout
+        else:
+            base_use = base
+
+        exp = max(0, min(int(attempt) - 1, 8))
+        delay = base_use * (2 ** exp)
+        delay = min(max_delay, max(0.0, delay))
+        if delay <= 0:
+            return 0.0
+        jitter = delay * jitter_ratio
+        if jitter > 0:
+            delay = delay + random.uniform(-jitter, jitter)
+        return max(0.0, min(max_delay, delay))
+
+    def get_runtime_status(self) -> dict:
+        key_count = len(self.api_keys)
+        blacklisted = LLM.get_blacklisted_key_count()
+        available = LLM.get_available_key_count(self.api_keys) if self.api_keys else 0
+        mode = "rps"
+        per_key_rpm = None
+        total_rpm = None
+        if getattr(self, "_multi_key_per_key_limiter_enable", False) and key_count > 1:
+            mode = "rpm_default"
+            per_key_rpm = float(getattr(self, "_per_key_limiter_rpm", 1.0) or 1.0)
+            total_rpm = per_key_rpm * key_count
+        blacklisted_keys = []
+        try:
+            now = time.time()
+            with LLM.KEY_LOCK:
+                for k, exp in LLM.BLACKLISTED_KEYS.items():
+                    if now >= exp:
+                        continue
+                    blacklisted_keys.append(
+                        {
+                            "key": (k[:6] + "…" + k[-4:]) if isinstance(k, str) and len(k) > 12 else "***",
+                            "expires_in_seconds": max(0, int(exp - now)),
+                        }
+                    )
+        except Exception:
+            blacklisted_keys = []
+
+        recent_keys = []
+        try:
+            now = time.time()
+            items = sorted(self._key_last_used_at.items(), key=lambda x: x[1], reverse=True)[:20]
+            for k, ts in items:
+                recent_keys.append(
+                    {
+                        "key": (k[:6] + "…" + k[-4:]) if isinstance(k, str) and len(k) > 12 else "***",
+                        "last_used_seconds_ago": max(0, int(now - ts)),
+                    }
+                )
+        except Exception:
+            recent_keys = []
+
+        return {
+            "mode": mode,
+            "key_count": key_count,
+            "available_keys": available,
+            "blacklisted_keys": blacklisted,
+            "blacklisted_key_items": blacklisted_keys,
+            "per_key_rpm": per_key_rpm,
+            "total_rpm": total_rpm,
+            "max_concurrent_requests": int(getattr(self, "max_concurrent_requests", 0) or 0),
+            "recent_key_items": recent_keys,
+            "runtime_stats": self.runtime_stats,
+        }
 
     async def do_request(self, messages: list, llm_config: LLMConfig, retry: bool, enable_thinking: bool = True, task_id: str = "") -> tuple[Exception, dict, str, str, dict, dict]:
         """
@@ -671,7 +1139,59 @@ class LLM:
                 llm_response = {"stream": True, "thinking": response_think[:200] if response_think else ""}
             else:
                 # 标准请求
-                response = await self.client.chat.completions.create(**llm_request)
+                from openai import PermissionDeniedError
+                last_exc: Exception | None = None
+                attempt_limit = max(1, min(len(self.api_keys) if self.api_keys else 1, 16))
+                response = None
+                current_key = ""
+                for _ in range(attempt_limit):
+                    try:
+                        current_key = LLM.get_key(self.api_keys)
+                        if current_key:
+                            try:
+                                self._key_last_used_at[current_key] = time_module.time()
+                            except Exception:
+                                pass
+                        client = self._get_client_for_key(current_key)
+                        per_key_limiter = self._get_per_key_limiter(current_key)
+                        self.runtime_stats["requests_started"] = int(self.runtime_stats.get("requests_started", 0)) + 1
+                        t0 = time_module.monotonic()
+                        async with self.semaphore:
+                            t1 = time_module.monotonic()
+                            self.runtime_stats["semaphore_wait_seconds"] = float(self.runtime_stats.get("semaphore_wait_seconds", 0.0)) + (t1 - t0)
+                            t2 = time_module.monotonic()
+                            async with self.async_limiter:
+                                t3 = time_module.monotonic()
+                                self.runtime_stats["global_limiter_wait_seconds"] = float(self.runtime_stats.get("global_limiter_wait_seconds", 0.0)) + (t3 - t2)
+                                if per_key_limiter is not None:
+                                    t4 = time_module.monotonic()
+                                    async with per_key_limiter:
+                                        t5 = time_module.monotonic()
+                                        self.runtime_stats["per_key_limiter_wait_seconds"] = float(self.runtime_stats.get("per_key_limiter_wait_seconds", 0.0)) + (t5 - t4)
+                                        response = await client.chat.completions.create(**llm_request)
+                                else:
+                                    response = await client.chat.completions.create(**llm_request)
+                        self.runtime_stats["requests_succeeded"] = int(self.runtime_stats.get("requests_succeeded", 0)) + 1
+                        break
+                    except PermissionDeniedError as e:
+                        error_msg = str(e)
+                        if self.RE_BLACKLIST_ERROR.search(error_msg) and current_key:
+                            try:
+                                LLM.add_to_blacklist(current_key, ttl_seconds=float(getattr(self.config, "api_key_blacklist_ttl_seconds", 3600) or 3600))
+                            except Exception:
+                                pass
+                            if LLM.get_available_key_count(self.api_keys) <= 0:
+                                raise
+                            last_exc = e
+                            continue
+                        raise
+                    except Exception as e:
+                        last_exc = e
+                        raise
+
+                if response is None and last_exc is not None:
+                    raise last_exc
+
                 llm_response = response.to_dict() if hasattr(response, "to_dict") else {"raw": str(response)}
                 
                 # 提取回复内容
@@ -692,6 +1212,16 @@ class LLM:
                 
                 input_tokens = usage.prompt_tokens if usage else 0
                 output_tokens = usage.completion_tokens if usage else 0
+
+            if response_result == "" and response_think:
+                if "```" in response_think and re.search(r"\{[\s\S]*\}", response_think):
+                    response_result = response_think.strip()
+                else:
+                    m = re.search(r"\{[\s\S]*\}", response_think)
+                    if m:
+                        response_result = m.group(0).strip()
+                    elif "【上下文" in response_think:
+                        response_result = response_think.strip()
             
             # 【已移除】API 响应详情打印（只保留最终任务结果表格，避免刷屏）
             # 如需调试，可取消下方注释：
@@ -704,7 +1234,15 @@ class LLM:
             # )
             
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError) and not str(e):
+                e = asyncio.TimeoutError("请求超时")
             error = e
+            try:
+                self.runtime_stats["requests_failed"] = int(self.runtime_stats.get("requests_failed", 0)) + 1
+                kind = self._classify_exception(e)
+                self._record_error(kind, e)
+            except Exception:
+                pass
             LogHelper.error(f"[LLM请求] 失败: {e}")
             try:
                 ErrorLogger.log(
@@ -785,6 +1323,33 @@ class LLM:
         
         return args
 
+    @staticmethod
+    def _delta_get(delta, key: str):
+        if delta is None:
+            return None
+        if isinstance(delta, dict):
+            return delta.get(key)
+        return getattr(delta, key, None)
+
+    @classmethod
+    def _extract_stream_text(cls, delta) -> tuple[str, str]:
+        think = ""
+        content = ""
+
+        for k in ("reasoning_content", "reasoning", "analysis", "thinking"):
+            v = cls._delta_get(delta, k)
+            if isinstance(v, str) and v:
+                think = v
+                break
+
+        for k in ("content", "text", "answer", "output_text"):
+            v = cls._delta_get(delta, k)
+            if isinstance(v, str) and v:
+                content = v
+                break
+
+        return think, content
+
     async def _do_stream_request(self, llm_request: dict, task_id: str = "") -> tuple[str, str, int, int]:
         """
         执行流式请求（用于深度思考模式）
@@ -816,180 +1381,293 @@ class LLM:
         # 获取全局 tracker
         tracker = get_current_tracker()
         
-        # 获取当前使用的 Key（多 Key 轮询）
-        current_key = LLM.get_key(self.api_keys)
-        
-        try:
-            # 获取对应 Key 的无超时客户端
-            stream_client = self._get_stream_client_for_key(current_key)
-            
-            # 发起流式请求
-            stream = await stream_client.chat.completions.create(**llm_request)
-            
-            async for chunk in stream:
-                chunk_count += 1
-                
-                # 检查是否有 choices
-                if not chunk.choices:
-                    # 最后一个 chunk 包含 usage 信息
-                    if hasattr(chunk, "usage") and chunk.usage is not None:
+        def is_retryable(e: Exception) -> bool:
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                return True
+            if isinstance(e, httpx.HTTPError):
+                return True
+            try:
+                import openai
+                retryable_types = []
+                for name in ("APITimeoutError", "InternalServerError", "RateLimitError", "APIConnectionError"):
+                    t = getattr(openai, name, None)
+                    if t:
+                        retryable_types.append(t)
+                if retryable_types and isinstance(e, tuple(retryable_types)):
+                    return True
+                api_status_error = getattr(openai, "APIStatusError", None)
+                if api_status_error and isinstance(e, api_status_error):
+                    status_code = getattr(e, "status_code", None)
+                    if status_code is None and hasattr(e, "response") and e.response is not None:
+                        status_code = getattr(e.response, "status_code", None)
+                    if status_code in {408, 429, 500, 502, 503, 504, 522, 524}:
+                        return True
+            except Exception:
+                pass
+            msg = str(e).lower()
+            markers = ("timeout", "timed out", "rate limit", "429", "connection", "connect", "reset", "broken pipe", "server error", "502", "503", "504")
+            return any(m in msg for m in markers)
+
+        last_exc: Exception | None = None
+        for attempt in range(self.stream_retry_attempts):
+            response_think = ""
+            response_result = ""
+            input_tokens = 0
+            output_tokens = 0
+            chunk_count = 0
+            is_thinking = True
+
+            try:
+                current_key = LLM.get_key(self.api_keys)
+                if current_key:
+                    try:
+                        self._key_last_used_at[current_key] = time.time()
+                    except Exception:
+                        pass
+                stream_client = self._get_stream_client_for_key(current_key)
+                per_key_limiter = self._get_per_key_limiter(current_key)
+                create_timeout = int(max(1, self.stream_first_chunk_timeout_seconds))
+                self.runtime_stats["requests_started"] = int(self.runtime_stats.get("requests_started", 0)) + 1
+                t0 = time.monotonic()
+                async with self.semaphore:
+                    t1 = time.monotonic()
+                    self.runtime_stats["semaphore_wait_seconds"] = float(self.runtime_stats.get("semaphore_wait_seconds", 0.0)) + (t1 - t0)
+                    try:
+                        t2 = time.monotonic()
+                        async with self.async_limiter:
+                            t3 = time.monotonic()
+                            self.runtime_stats["global_limiter_wait_seconds"] = float(self.runtime_stats.get("global_limiter_wait_seconds", 0.0)) + (t3 - t2)
+                            if per_key_limiter is not None:
+                                t4 = time.monotonic()
+                                async with per_key_limiter:
+                                    t5 = time.monotonic()
+                                    self.runtime_stats["per_key_limiter_wait_seconds"] = float(self.runtime_stats.get("per_key_limiter_wait_seconds", 0.0)) + (t5 - t4)
+                                    stream = await asyncio.wait_for(
+                                        stream_client.chat.completions.create(**llm_request),
+                                        timeout=create_timeout,
+                                    )
+                            else:
+                                stream = await asyncio.wait_for(
+                                    stream_client.chat.completions.create(**llm_request),
+                                    timeout=create_timeout,
+                                )
+                    except asyncio.TimeoutError as e:
+                        raise asyncio.TimeoutError(f"首包超时: {create_timeout}s 无任何数据") from e
+
+                    aiter = stream.__aiter__()
+                    got_first_chunk = False
+
+                    while True:
+                        timeout_seconds = self.stream_first_chunk_timeout_seconds if not got_first_chunk else self.stream_stall_timeout_seconds
+                        timeout_seconds = int(max(1, timeout_seconds))
                         try:
-                            input_tokens = int(chunk.usage.prompt_tokens)
-                        except:
-                            pass
-                        try:
-                            output_tokens = int(chunk.usage.completion_tokens)
-                        except:
-                            pass
+                            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=timeout_seconds)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError as e:
+                            try:
+                                close = getattr(stream, "close", None)
+                                if close:
+                                    r = close()
+                                    if asyncio.iscoroutine(r):
+                                        await r
+                            except Exception:
+                                pass
+                            if not got_first_chunk:
+                                raise asyncio.TimeoutError(f"首包超时: {timeout_seconds}s 无任何数据") from e
+                            raise asyncio.TimeoutError(f"流式响应超时: {timeout_seconds}s 无新数据") from e
+
+                        got_first_chunk = True
+                        chunk_count += 1
+
+                        if not chunk.choices:
+                            if hasattr(chunk, "usage") and chunk.usage is not None:
+                                try:
+                                    input_tokens = int(chunk.usage.prompt_tokens)
+                                except Exception:
+                                    pass
+                                try:
+                                    output_tokens = int(chunk.usage.completion_tokens)
+                                except Exception:
+                                    pass
+                            continue
+
+                        delta = chunk.choices[0].delta
+                        delta_think, delta_content = __class__._extract_stream_text(delta)
+
+                        if delta_think:
+                            response_think += delta_think
+                            if tracker and task_id:
+                                tracker.update_task(
+                                    task_id=task_id,
+                                    status="thinking",
+                                    think_chars=len(response_think),
+                                    reply_chars=len(response_result),
+                                    chunks=chunk_count,
+                                )
+
+                        if delta_content:
+                            if is_thinking:
+                                is_thinking = False
+                            response_result += delta_content
+                            if tracker and task_id:
+                                tracker.update_task(
+                                    task_id=task_id,
+                                    status="receiving",
+                                    think_chars=len(response_think),
+                                    reply_chars=len(response_result),
+                                    chunks=chunk_count,
+                                )
+
+                response_think = self.RE_LINE_BREAK.sub("\n", response_think.strip())
+                response_result = response_result.strip()
+                if response_result == "" and response_think:
+                    if "```" in response_think and re.search(r"\{[\s\S]*\}", response_think):
+                        response_result = response_think.strip()
+                    else:
+                        m = re.search(r"\{[\s\S]*\}", response_think)
+                        if m:
+                            response_result = m.group(0).strip()
+                        elif "【上下文" in response_think:
+                            response_result = response_think.strip()
+                self.runtime_stats["requests_succeeded"] = int(self.runtime_stats.get("requests_succeeded", 0)) + 1
+                return response_think, response_result, input_tokens, output_tokens
+
+            except PermissionDeniedError as e:
+                error_msg = str(e)
+                if self.RE_BLACKLIST_ERROR.search(error_msg):
+                    try:
+                        LLM.add_to_blacklist(current_key, ttl_seconds=float(getattr(self.config, "api_key_blacklist_ttl_seconds", 3600) or 3600))
+                    except Exception:
+                        pass
+                    available_count = LLM.get_available_key_count(self.api_keys)
+                    if available_count <= 0:
+                        LogHelper.error(f"[致命错误] 所有 API Key 均已被封禁，任务无法继续！")
+                        raise
+                    last_exc = e
                     continue
-                
-                delta = chunk.choices[0].delta
-                
-                # 收集思考内容 (reasoning_content)
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
-                    response_think += delta.reasoning_content
-                    # 更新全局 tracker
-                    if tracker and task_id:
-                        tracker.update_task(
-                            task_id=task_id,
-                            status="thinking",
-                            think_chars=len(response_think),
-                            reply_chars=len(response_result),
-                            chunks=chunk_count,
+                raise
+
+            except RuntimeError as e:
+                LogHelper.error(f"[致命错误] {e}")
+                raise
+
+            except Exception as e:
+                last_exc = e
+                try:
+                    kind = self._classify_exception(e)
+                    self._record_error(kind, e)
+                except Exception:
+                    pass
+                if attempt + 1 >= self.stream_retry_attempts or not is_retryable(e):
+                    try:
+                        ErrorLogger.log(
+                            error_type="StreamRequestError",
+                            message=str(e),
+                            context={
+                                "task_id": task_id,
+                                "attempt": attempt + 1,
+                                "max_attempts": self.stream_retry_attempts,
+                                "base_url": getattr(self, "base_url", ""),
+                                "model": getattr(self, "model_name", ""),
+                                "current_key": current_key if "current_key" in locals() else "",
+                                "chunk_count": chunk_count,
+                                "response_think": response_think,
+                                "response_result": response_result,
+                                "llm_request": llm_request,
+                                "traceback": LogHelper.get_trackback(e),
+                            },
                         )
-                
-                # 收集回复内容 (content)
-                if hasattr(delta, "content") and delta.content is not None:
-                    if is_thinking:
-                        is_thinking = False
-                    response_result += delta.content
-                    # 更新全局 tracker
-                    if tracker and task_id:
-                        tracker.update_task(
-                            task_id=task_id,
-                            status="receiving",
-                            think_chars=len(response_think),
-                            reply_chars=len(response_result),
-                            chunks=chunk_count,
-                        )
-            
-            # 清理格式
-            response_think = self.RE_LINE_BREAK.sub("\n", response_think.strip())
-            response_result = response_result.strip()
-        
-        except PermissionDeniedError as e:
-            # 403 错误 - 检查是否为黑名单封禁
-            error_msg = str(e)
-            if self.RE_BLACKLIST_ERROR.search(error_msg):
-                # 将该 Key 加入黑名单
-                LLM.add_to_blacklist(current_key)
-                LogHelper.error(f"")
-                LogHelper.error(f"[致命错误] API Key 已被服务商封禁: {current_key[:20]}...")
-                LogHelper.error(f"[致命错误] 封禁原因: {error_msg}")
-                LogHelper.error(f"")
-                
-                # 检查是否还有可用的 Key
-                available_count = LLM.get_available_key_count(self.api_keys)
-                if available_count > 0:
-                    LogHelper.warning(f"[API轮询] 剩余可用 Key: {available_count} 个，继续使用其他 Key")
-                else:
-                    LogHelper.error(f"[致命错误] 所有 API Key 均已被封禁，任务无法继续！")
-            else:
-                LogHelper.error(f"[流式请求] 权限错误: {e}")
-            raise
-        
-        except RuntimeError as e:
-            # 所有 Key 被封禁的异常
-            LogHelper.error(f"[致命错误] {e}")
-            raise
-            
-        except Exception as e:
-            LogHelper.error(f"[流式请求] 失败: {e}")
-            raise
-        
-        return response_think, response_result, input_tokens, output_tokens
+                    except Exception:
+                        pass
+                    raise
+                wait_time = self.stream_retry_backoff_seconds * (attempt + 1)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("流式请求失败：未知错误")
 
     # 接口测试任务
     async def api_test(self) -> bool:
-        async with self.semaphore, self.async_limiter:
+        llm_request = {}
+        llm_response = {}
+        try:
+            success = False
+
+            error, usage, _, response_result, llm_request, llm_response = await self.do_request(
+                [
+                    {
+                        "role": "system",
+                        "content": self.prompt_surface_analysis_without_translation.replace("{PROMPT_GROUPS}", "、".join(("角色", "其他"))),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "目标词语：ダリヤ\n"
+                            "参考文本原文：\n"
+                            "魔導具師ダリヤはうつむかない"
+                        ),
+                    },
+                ],
+                LLM.API_TEST_CONFIG,
+                True
+            )
+
+            if error != None:
+                raise error
+
+            if usage.completion_tokens >= LLM.SURFACE_ANALYSIS_CONFIG.MAX_TOKENS:
+                raise Exception("返回结果错误（模型退化） ...")
+
             try:
-                success = False
-
-                error, usage, _, response_result, llm_request, llm_response = await self.do_request(
-                    [
-                        {
-                            "role": "system",
-                            "content": self.prompt_surface_analysis_without_translation.replace("{PROMPT_GROUPS}", "、".join(("角色", "其他"))),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "目标词语：ダリヤ\n"
-                                "参考文本原文：\n"
-                                "魔導具師ダリヤはうつむかない"
-                            ),
-                        },
-                    ],
-                    LLM.API_TEST_CONFIG,
-                    True
-                )
-
-                # 检查错误
-                if error != None:
-                    raise error
-
-                # 检查是否超过最大 token 限制
-                if usage.completion_tokens >= LLM.SURFACE_ANALYSIS_CONFIG.MAX_TOKENS:
-                    raise Exception("返回结果错误（模型退化） ...")
-
-                # 反序列化 JSON
-                try:
-                    # 尝试清理非 JSON 内容（有时模型会在 JSON 外输出废话）
-                    clean_json = response_result
-                    if "```json" in clean_json:
-                        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-                    elif "```" in clean_json:
-                        clean_json = clean_json.split("```")[1].split("```")[0].strip()
-                    
-                    # 尝试修复常见的 JSON 格式错误
-                    # 1. 修复未转义的换行符
-                    clean_json = clean_json.replace("\n", "\\n")
-                    # 2. 修复中文引号
-                    clean_json = clean_json.replace("“", '"').replace("”", '"')
-                    
-                    result = repair.loads(clean_json)
-                except Exception as e:
-                    LogHelper.warning(f"[JSON解析] 初次解析失败，尝试暴力修复: {e}")
-                    # 暴力提取 JSON 对象
-                    try:
-                        json_match = re.search(r"\{.*\}", response_result, re.DOTALL)
-                        if json_match:
-                            clean_json = json_match.group(0)
-                            result = repair.loads(clean_json)
-                        else:
-                            raise Exception("未找到有效的 JSON 对象")
-                    except Exception as e2:
-                        raise Exception(f"JSON 解析完全失败: {e2} | 原文: {response_result[:100]}...")
-
-                if not isinstance(result, dict) or result == {}:
-                    raise Exception("返回结果错误（数据结构） ...")
-
-                # 输出结果
-                success = True
-                LogHelper.info(f"{result}")
-
-                return success
+                clean_json = (response_result or "").strip()
+                if "```json" in clean_json:
+                    clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_json:
+                    clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                
+                clean_json = clean_json.removesuffix("...").strip()
+                clean_json = clean_json.replace("“", '"').replace("”", '"')
+                
+                result = repair.loads(clean_json)
             except Exception as e:
-                LogHelper.warning(f"{LogHelper.get_trackback(e)}")
-                LogHelper.warning(f"llm_request - {llm_request}")
-                LogHelper.warning(f"llm_response - {llm_response}")
+                LogHelper.warning(f"[JSON解析] 初次解析失败，尝试暴力修复: {e}")
+                try:
+                    json_match = re.search(r"\{.*\}", response_result, re.DOTALL)
+                    if json_match:
+                        clean_json = json_match.group(0).strip().removesuffix("...").strip()
+                        clean_json = clean_json.replace("“", '"').replace("”", '"')
+                        result = repair.loads(clean_json)
+                    else:
+                        raise Exception("未找到有效的 JSON 对象")
+                except Exception as e2:
+                    raise Exception(f"JSON 解析完全失败: {e2} | 原文: {response_result[:100]}...")
+
+            if not isinstance(result, dict) or result == {}:
+                raise Exception("返回结果错误（数据结构） ...")
+
+            success = True
+            LogHelper.info(f"{result}")
+
+            return success
+        except Exception as e:
+            LogHelper.warning(f"{LogHelper.get_trackback(e)}")
+            LogHelper.warning(f"llm_request - {llm_request}")
+            LogHelper.warning(f"llm_response - {llm_response}")
 
     # 词义分析任务（支持使用已翻译的参考文本）
-    async def surface_analysis(self, word: Word, words: list[Word], fake_name_mapping: dict[str, str], success: list[Word], retry: bool, last_round: bool, task_id: str = "") -> None:
+    async def surface_analysis(self, word: Word, words: list[Word], fake_name_mapping: dict[str, str], retry: bool, last_round: bool, task_id: str = "") -> Exception | None:
         import time as time_module
         start_time = time_module.time()
+        response_think = ""
+        response_result = ""
+        usage = None
+        error = None
         
-        async with self.semaphore, self.async_limiter:
+        if True:
             try:
                 if not hasattr(self, "prompt_groups"):
                     x = [v for group in LLM.GROUP_MAPPING.values() for v in group]
@@ -1034,38 +1712,30 @@ class LLM:
                         + "\n" + f"参考文本原文：\n{context_original}"
                     )
 
-                # 【新增】使用 asyncio.wait_for 添加超时控制
-                try:
-                    error, usage, response_think, response_result, llm_request, llm_response = await asyncio.wait_for(
-                        self.do_request(
-                            [
-                                {
-                                    "role": "system",
-                                    "content": system_prompt,
-                                },
-                                {
-                                    "role": "user",
-                                    "content": user_content,
-                                },
-                            ],
-                            LLM.SURFACE_ANALYSIS_CONFIG,
-                            retry,
-                            task_id=task_id,
-                        ),
-                        timeout=LLM.TASK_TIMEOUT_THRESHOLD  # 430秒超时
-                    )
-                except asyncio.TimeoutError:
-                    # 【超时处理】触发上下文限缩，重新采样
+                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
+                    [
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_content,
+                        },
+                    ],
+                    LLM.SURFACE_ANALYSIS_CONFIG,
+                    retry,
+                    task_id=task_id,
+                )
+
+                if error is not None and ("首包超时" in str(error) or "流式响应超时" in str(error) or "请求超时" in str(error) or "任务超时" in str(error)):
                     elapsed = time_module.time() - start_time
-                    
-                    # 提升限缩级别（减少上下文采样数量）
                     word.context_shrink_level += 1
-                    
                     LogTable.print_llm_task(
                         task_name="词义分析",
                         word_surface=word.surface,
                         status="warning",
-                        message=f"⏱️ 超时 ({elapsed:.0f}s > {LLM.TASK_TIMEOUT_THRESHOLD}s)，触发限缩: level {word.context_shrink_level}",
+                        message=f"⏱️ 首包/流式超时 ({elapsed:.0f}s > {self.stream_first_chunk_timeout_seconds}s)，触发限缩: level {word.context_shrink_level}",
                         elapsed_time=elapsed,
                         extra_info={
                             "限缩级别": word.context_shrink_level,
@@ -1232,6 +1902,28 @@ class LLM:
                     )
             except Exception as e:
                 # 失败：打印详细错误日志
+                try:
+                    ErrorLogger.log(
+                        error_type="SurfaceAnalysisError",
+                        message=str(e),
+                        context={
+                            "task_id": task_id,
+                            "word_surface": getattr(word, "surface", ""),
+                            "context_shrink_level": getattr(word, "context_shrink_level", 0),
+                            "retry": bool(retry),
+                            "last_round": bool(last_round),
+                            "request_content": user_content if "user_content" in dir() else "",
+                            "response_think": response_think if "response_think" in dir() else "",
+                            "response_result": response_result if "response_result" in dir() else "",
+                            "usage": {
+                                "prompt_tokens": getattr(usage, "prompt_tokens", 0) if "usage" in dir() and usage else 0,
+                                "completion_tokens": getattr(usage, "completion_tokens", 0) if "usage" in dir() and usage else 0,
+                            },
+                            "traceback": LogHelper.get_trackback(e),
+                        },
+                    )
+                except Exception:
+                    pass
                 LogTable.print_llm_task(
                     task_name="词义分析",
                     word_surface=word.surface,
@@ -1244,26 +1936,130 @@ class LLM:
                     elapsed_time=time_module.time() - start_time,
                 )
                 error = e
-            finally:
-                # 更新全局 tracker 状态
-                tracker = get_current_tracker()
-                if tracker and task_id:
-                    tracker.complete_task(task_id, success=(error is None), error=str(error) if error else None)
-                
-                if error == None:
-                    with self.lock:
-                        success.append(word)
+        return error
 
     # 批量执行词义分析任务
+    async def translate_and_surface_analysis_batch(self, words: list[Word], fake_name_mapping: dict[str, str]) -> list[Word]:
+        import time as time_module
+        batch_start_time = time_module.time()
+
+        failure: list[Word] = []
+        success: list[Word] = []
+
+        LogTable.print_stage_header("参考翻译 + 词义分析", stage_num=1)
+        LogHelper.info(f"待处理词条数: {len(words)}")
+        LogHelper.print("")
+
+        translate_total = len(words) if self.language != NER.Language.ZH else 0
+        with TaskTracker(
+            total=len(words),
+            task_name="翻译+校对",
+            max_concurrent=self.max_concurrent_requests,
+            translate_total=translate_total,
+            review_total=len(words),
+        ) as tracker:
+            set_current_tracker(tracker)
+            try:
+                ct_attempts: dict[int, int] = {i: 0 for i in range(len(words))}
+                sa_attempts: dict[int, int] = {i: 0 for i in range(len(words))}
+                task_ids: dict[int, str] = {i: f"task_{i}_{words[i].surface}" for i in range(len(words))}
+
+                queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+                for i in range(len(words)):
+                    queue.put_nowait((0.0, i))
+
+                worker_count = self._get_worker_count(len(words))
+
+                async def worker() -> None:
+                    while True:
+                        ready_at, idx = await queue.get()
+                        try:
+                            if idx is None:
+                                return
+                            now = time_module.time()
+                            if ready_at > now:
+                                await asyncio.sleep(ready_at - now)
+
+                            word = words[idx]
+                            task_id = task_ids[idx]
+
+                            if self.language != NER.Language.ZH:
+                                err = await self.context_translate(word, words, retry=ct_attempts[idx] > 0, task_id=task_id)
+                                if err is not None:
+                                    tracker.complete_task(task_id, success=False, error=str(err))
+                                    ct_attempts[idx] += 1
+                                    if ct_attempts[idx] <= LLM.MAX_RETRY:
+                                        tracker.reopen_task(task_id)
+                                        delay = self._compute_retry_delay_seconds(err, ct_attempts[idx])
+                                        queue.put_nowait((time_module.time() + delay, idx))
+                                    else:
+                                        failure.append(word)
+                                    continue
+                                tracker.mark_translated(task_id)
+
+                            err = await self.surface_analysis(
+                                word,
+                                words,
+                                fake_name_mapping,
+                                retry=sa_attempts[idx] > 0,
+                                last_round=sa_attempts[idx] >= LLM.MAX_RETRY,
+                                task_id=task_id,
+                            )
+                            if err is None:
+                                success.append(word)
+                                tracker.complete_task(task_id, success=True)
+                                continue
+
+                            tracker.complete_task(task_id, success=False, error=str(err))
+                            sa_attempts[idx] += 1
+
+                            if sa_attempts[idx] >= LLM.FORCE_TRANSLITERATE_THRESHOLD:
+                                if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
+                                    LogTable.print_retry_info(
+                                        word_surface=word.surface,
+                                        retry_count=sa_attempts[idx],
+                                        max_retry=LLM.FORCE_TRANSLITERATE_THRESHOLD,
+                                        reason="触发强制音译",
+                                    )
+                                    word.surface_translation = self.force_transliterate(word.surface)
+                                tracker.reopen_task(task_id)
+                                success.append(word)
+                                tracker.complete_task(task_id, success=True)
+                                continue
+
+                            if sa_attempts[idx] <= LLM.MAX_RETRY:
+                                tracker.reopen_task(task_id)
+                                delay = self._compute_retry_delay_seconds(err, sa_attempts[idx])
+                                queue.put_nowait((time_module.time() + delay, idx))
+                            else:
+                                failure.append(word)
+                        finally:
+                            queue.task_done()
+
+                workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+                await queue.join()
+                for _ in range(worker_count):
+                    queue.put_nowait((0.0, None))
+                await asyncio.gather(*workers)
+            finally:
+                set_current_tracker(None)
+
+        LogTable.print_batch_summary(
+            task_name="翻译+校对",
+            total=len(words),
+            success=len(success),
+            failed=len(failure),
+            elapsed_time=time_module.time() - batch_start_time,
+        )
+
+        return words
+
     async def surface_analysis_batch(self, words: list[Word], fake_name_mapping: dict[str, str]) -> list[Word]:
         import time as time_module
         batch_start_time = time_module.time()
         
         failure: list[Word] = []
         success: list[Word] = []
-        
-        # 记录每个词条的重试次数
-        retry_counts: dict[str, int] = {}
 
         # 打印阶段标题
         LogTable.print_stage_header("词义分析", stage_num=2)
@@ -1276,59 +2072,67 @@ class LLM:
             set_current_tracker(tracker)
             
             try:
-                for i in range(LLM.MAX_RETRY + 1):
-                    if i == 0:
-                        retry = False
-                        words_this_round = words
-                    elif len(failure) > 0:
-                        retry = True
-                        words_this_round = failure
-                        
-                        # 更新 tracker 重试计数
-                        tracker.add_retry()
-                        
-                        # 达到强制音译阈值的词条，直接使用强制音译，不再重试
-                        still_retry = []
-                        for word in words_this_round:
-                            key = f"{word.surface}|{word.group}"
-                            retry_counts[key] = retry_counts.get(key, 0) + 1
-                            
-                            if retry_counts[key] >= LLM.FORCE_TRANSLITERATE_THRESHOLD:
-                                # 直接使用强制音译
+                attempts: dict[int, int] = {i: 0 for i in range(len(words))}
+                task_ids: dict[int, str] = {i: f"sa_{i}_{words[i].surface}" for i in range(len(words))}
+
+                queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+                for i in range(len(words)):
+                    queue.put_nowait((0.0, i))
+
+                worker_count = self._get_worker_count(len(words))
+
+                async def worker() -> None:
+                    while True:
+                        ready_at, idx = await queue.get()
+                        try:
+                            if idx is None:
+                                return
+                            now = time_module.time()
+                            if ready_at > now:
+                                await asyncio.sleep(ready_at - now)
+
+                            word = words[idx]
+                            task_id = task_ids[idx]
+                            retry = attempts[idx] > 0
+                            last_round = attempts[idx] >= LLM.MAX_RETRY
+
+                            err = await self.surface_analysis(word, words, fake_name_mapping, retry, last_round, task_id=task_id)
+                            if err is None:
+                                success.append(word)
+                                tracker.complete_task(task_id, success=True)
+                                continue
+
+                            tracker.complete_task(task_id, success=False, error=str(err))
+                            attempts[idx] += 1
+
+                            if attempts[idx] >= LLM.FORCE_TRANSLITERATE_THRESHOLD:
                                 if word.surface_translation and LLM.contains_kana_strict(word.surface_translation):
                                     LogTable.print_retry_info(
                                         word_surface=word.surface,
-                                        retry_count=retry_counts[key],
+                                        retry_count=attempts[idx],
                                         max_retry=LLM.FORCE_TRANSLITERATE_THRESHOLD,
                                         reason="触发强制音译",
                                     )
                                     word.surface_translation = self.force_transliterate(word.surface)
-                                with self.lock:
-                                    success.append(word)
-                                # 更新 tracker 完成数
-                                tracker.complete_task(f"force_{word.surface}", success=True)
+                                tracker.reopen_task(task_id)
+                                success.append(word)
+                                tracker.complete_task(task_id, success=True)
+                                continue
+
+                            if attempts[idx] <= LLM.MAX_RETRY:
+                                tracker.reopen_task(task_id)
+                                delay = self._compute_retry_delay_seconds(err, attempts[idx])
+                                queue.put_nowait((time_module.time() + delay, idx))
                             else:
-                                still_retry.append(word)
-                        
-                        words_this_round = still_retry
-                        if not words_this_round:
-                            break
-                        
-                        tracker.set_description(f"[yellow]词义分析 (重试 {i}/{LLM.MAX_RETRY})")
-                    else:
-                        break
+                                failure.append(word)
+                        finally:
+                            queue.task_done()
 
-                    # 执行异步任务，传递 task_id 给每个任务
-                    async def run_with_tracker(word: Word, task_idx: int):
-                        task_id = f"sa_{task_idx}_{word.surface}"
-                        await self.surface_analysis(word, words, fake_name_mapping, success, retry, i == LLM.MAX_RETRY, task_id=task_id)
-                    
-                    tasks = [asyncio.create_task(run_with_tracker(word, idx)) for idx, word in enumerate(words_this_round)]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-                    # 获得失败任务的列表
-                    success_pairs = {(word.surface, word.group) for word in success}
-                    failure = [word for word in words if (word.surface, word.group) not in success_pairs]
+                workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+                await queue.join()
+                for _ in range(worker_count):
+                    queue.put_nowait((0.0, None))
+                await asyncio.gather(*workers)
             finally:
                 # 清除全局 tracker
                 set_current_tracker(None)
@@ -1438,15 +2242,16 @@ class LLM:
         return "".join(result) if result else romaji
 
     # 参考文本翻译任务（新流程：在词义分析之前执行，为其提供上下文理解）
-    async def context_translate(self, word: Word, words: list[Word], success: list[Word], retry: bool, task_id: str = "") -> None:
+    async def context_translate(self, word: Word, words: list[Word], retry: bool, task_id: str = "") -> Exception | None:
         import time as time_module
         start_time = time_module.time()
         context_str = ""
+        response_think = ""
         response_result = ""
         usage = None
         error = None
         
-        async with self.semaphore, self.async_limiter:
+        if True:
             try:
                 # 获取参考文本（使用增加后的 token 阈值）
                 # 【关键】context_shrink_level 会影响采样数量，返回本次使用的索引
@@ -1462,50 +2267,34 @@ class LLM:
                         elapsed_time=time_module.time() - start_time,
                     )
                     word.context_translation = []
-                    with self.lock:
-                        success.append(word)
-                    # 更新 tracker
-                    tracker = get_current_tracker()
-                    if tracker and task_id:
-                        tracker.complete_task(task_id, success=True)
                     return
                 
-                # 【新增】使用 asyncio.wait_for 添加超时控制
-                try:
-                    error, usage, response_think, response_result, llm_request, llm_response = await asyncio.wait_for(
-                        self.do_request(
-                            [
-                                {
-                                    "role": "system",
-                                    "content": self.prompt_context_translate,
-                                },
-                                {
-                                    "role": "user",
-                                    "content": f"参考上下文：\n{context_str}",
-                                },
-                            ],
-                            LLM.CONTEXT_TRANSLATE_CONFIG,
-                            retry,
-                            task_id=task_id,
-                        ),
-                        timeout=LLM.TASK_TIMEOUT_THRESHOLD  # 430秒超时
-                    )
-                except asyncio.TimeoutError:
-                    # 【超时处理】触发上下文限缩，重新采样
+                error, usage, response_think, response_result, llm_request, llm_response = await self.do_request(
+                    [
+                        {
+                            "role": "system",
+                            "content": self.prompt_context_translate,
+                        },
+                        {
+                            "role": "user",
+                            "content": f"参考上下文：\n{context_str}",
+                        },
+                    ],
+                    LLM.CONTEXT_TRANSLATE_CONFIG,
+                    retry,
+                    task_id=task_id,
+                )
+
+                if error is not None and ("首包超时" in str(error) or "流式响应超时" in str(error) or "请求超时" in str(error) or "任务超时" in str(error)):
                     elapsed = time_module.time() - start_time
-                    
-                    # 记录本次失败的上下文索引
                     for idx in sampled_indices:
                         word.failed_context_indices.add(idx)
-                    
-                    # 提升限缩级别（减少上下文采样数量）
                     word.context_shrink_level += 1
-                    
                     LogTable.print_llm_task(
                         task_name="参考文本翻译",
                         word_surface=word.surface,
                         status="warning",
-                        message=f"⏱️ 超时 ({elapsed:.0f}s > {LLM.TASK_TIMEOUT_THRESHOLD}s)，触发限缩: level {word.context_shrink_level}",
+                        message=f"⏱️ 首包/流式超时 ({elapsed:.0f}s > {self.stream_first_chunk_timeout_seconds}s)，触发限缩: level {word.context_shrink_level}",
                         request_content=context_str[:200] + "..." if len(context_str) > 200 else context_str,
                         elapsed_time=elapsed,
                         extra_info={
@@ -1550,32 +2339,97 @@ class LLM:
                 if usage.completion_tokens >= LLM.CONTEXT_TRANSLATE_CONFIG.MAX_TOKENS:
                     raise Exception("返回结果错误（模型退化） ...")
 
-                context_translation = [line.strip() for line in response_result.splitlines() if line.strip() != ""]
+                try:
+                    context_translation, parse_detail = LLM.parse_context_translate_output(context_str, response_result)
+                except Exception as e:
+                    try:
+                        ErrorLogger.log(
+                            error_type="ContextTranslateParseError",
+                            message=str(e),
+                            context={
+                                "task_id": task_id,
+                                "word_surface": getattr(word, "surface", ""),
+                                "context_shrink_level": getattr(word, "context_shrink_level", 0),
+                                "sampled_indices": str(sampled_indices) if "sampled_indices" in locals() else "",
+                                "context_str": context_str,
+                                "response_result": response_result,
+                                "traceback": LogHelper.get_trackback(e),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    raise
                 
                 # 【新增】退化检测：检查整体输出是否存在重复模式
                 if LLM.is_degraded(response_result):
                     raise Exception("模型退化（输出重复内容）")
+
+                if not context_translation:
+                    raise Exception("返回结果错误（空回复） ...")
+
+                missing_contexts = parse_detail.get("missing_contexts") if isinstance(parse_detail, dict) else []
+                expected_contexts = parse_detail.get("expected_contexts") if isinstance(parse_detail, dict) else 0
+                if isinstance(missing_contexts, list) and isinstance(expected_contexts, int) and expected_contexts > 0:
+                    if len(missing_contexts) >= max(3, expected_contexts // 3):
+                        # C:\LLM\BookTerm Gacha - Experiment 不强制要求行数/上下文完全对应
+                        # 仅记录警告，不抛出异常，以免浪费并发资源
+                        LogTable.print_llm_task(
+                            task_name="参考文本翻译",
+                            word_surface=word.surface,
+                            status="warning",
+                            message=f"上下文缺失 {len(missing_contexts)}/{expected_contexts} (非致命)，继续处理",
+                        )
+
+                body_text = "\n".join([line for line in context_translation if not (line or "").strip().startswith("【")]).strip()
+                kana_ratio = LLM._calc_kana_ratio(body_text)
+                if kana_ratio >= 0.05:
+                    raise Exception(f"翻译失效（假名残留过多，{kana_ratio:.1%}）")
                 
                 # 【新增】相似度检测：逐行检查，高相似度说明未真正翻译
                 SIMILARITY_THRESHOLD = 0.80
                 original_lines = [line.strip() for line in context_str.splitlines() if line.strip() != ""]
+                header_re = re.compile(r"^【\s*上下文\s*\d+\s*】$")
                 
                 # 只在行数匹配时做逐行相似度检测
                 if len(context_translation) == len(original_lines):
                     high_similarity_count = 0
                     for orig, trans in zip(original_lines, context_translation):
+                        if header_re.match(orig) or header_re.match(trans):
+                            continue
+                        if re.search(r"[\u3040-\u30FFA-Za-z]", orig) is None:
+                            continue
                         similarity = LLM.check_similarity(orig, trans)
                         if similarity >= SIMILARITY_THRESHOLD:
                             high_similarity_count += 1
                     
                     # 超过50%的行高相似度，认为翻译基本失效
                     if high_similarity_count > len(original_lines) * 0.5:
-                        raise Exception(f"翻译失效（相似度过高，{high_similarity_count}/{len(original_lines)} 行）")
+                        # 再次检查是否包含中文（避免误判）
+                        # 计算汉字比例（排除标点等）
+                        cn_char_count = len(re.findall(r"[\u4e00-\u9fa5]", body_text))
+                        total_char_count = len(body_text)
+                        cn_ratio = cn_char_count / total_char_count if total_char_count > 0 else 0
+                        
+                        if cn_ratio < 0.2: # 如果中文比例确实很低，才报错
+                            raise Exception(f"翻译失效（相似度过高且中文比例低 {cn_ratio:.1%}，{high_similarity_count}/{len(original_lines)} 行）")
+                        else:
+                            LogTable.print_llm_task(
+                                task_name="参考文本翻译",
+                                word_surface=word.surface,
+                                status="warning",
+                                message=f"相似度较高但包含中文 ({cn_ratio:.1%})，保留结果",
+                            )
                 
                 # 检测翻译是否失效：仅当译文与原文【完全相同】且【原文确实包含明显外文成分】时才报错。
                 has_obvious_foreign = re.search(r"[\u3040-\u30FF\uAC00-\uD7AFA-Za-z]", context_str) is not None
                 if len(context_translation) > 0 and context_translation == original_lines and has_obvious_foreign:
-                    raise Exception("翻译失效（译文与原文相同） ...")
+                    # 同样增加中文比例检查
+                    cn_char_count = len(re.findall(r"[\u4e00-\u9fa5]", body_text))
+                    total_char_count = len(body_text)
+                    cn_ratio = cn_char_count / total_char_count if total_char_count > 0 else 0
+                    
+                    if cn_ratio < 0.2:
+                        raise Exception("翻译失效（译文与原文相同） ...")
 
                 word.context_translation = context_translation
                 word.llmrequest_context_translate = llm_request
@@ -1601,6 +2455,28 @@ class LLM:
                 )
             except Exception as e:
                 # 失败：打印详细错误日志
+                try:
+                    ErrorLogger.log(
+                        error_type="ContextTranslateError",
+                        message=str(e),
+                        context={
+                            "task_id": task_id,
+                            "word_surface": getattr(word, "surface", ""),
+                            "context_shrink_level": getattr(word, "context_shrink_level", 0),
+                            "failed_context_indices_count": len(getattr(word, "failed_context_indices", set()) or set()),
+                            "sampled_indices": str(sampled_indices) if "sampled_indices" in locals() else "",
+                            "context_str": context_str,
+                            "response_think": response_think,
+                            "response_result": response_result,
+                            "usage": {
+                                "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                                "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                            },
+                            "traceback": LogHelper.get_trackback(e),
+                        },
+                    )
+                except Exception:
+                    pass
                 LogTable.print_llm_task(
                     task_name="参考文本翻译",
                     word_surface=word.surface,
@@ -1613,15 +2489,7 @@ class LLM:
                     elapsed_time=time_module.time() - start_time,
                 )
                 error = e
-            finally:
-                # 更新全局 tracker 状态
-                tracker = get_current_tracker()
-                if tracker and task_id:
-                    tracker.complete_task(task_id, success=(error is None), error=str(error) if error else None)
-                
-                if error == None:
-                    with self.lock:
-                        success.append(word)
+        return error
 
     # 批量执行参考文本翻译任务
     async def context_translate_batch(self, words: list[Word]) -> list[Word]:
@@ -1642,29 +2510,52 @@ class LLM:
             set_current_tracker(tracker)
             
             try:
-                for i in range(LLM.MAX_RETRY + 1):
-                    if i == 0:
-                        retry = False
-                        words_this_round = words
-                    elif len(failure) > 0:
-                        retry = True
-                        words_this_round = failure
-                        tracker.add_retry()
-                        tracker.set_description(f"[yellow]参考文本翻译 (重试 {i}/{LLM.MAX_RETRY})")
-                    else:
-                        break
+                attempts: dict[int, int] = {i: 0 for i in range(len(words))}
+                task_ids: dict[int, str] = {i: f"ct_{i}_{words[i].surface}" for i in range(len(words))}
 
-                    # 执行异步任务，传递 task_id 给每个任务
-                    async def run_with_tracker(word: Word, task_idx: int):
-                        task_id = f"ct_{task_idx}_{word.surface}"
-                        await self.context_translate(word, words, success, retry, task_id=task_id)
-                    
-                    tasks = [asyncio.create_task(run_with_tracker(word, idx)) for idx, word in enumerate(words_this_round)]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+                for i in range(len(words)):
+                    queue.put_nowait((0.0, i))
 
-                    # 获得失败任务的列表
-                    success_pairs = {(word.surface, word.group) for word in success}
-                    failure = [word for word in words if (word.surface, word.group) not in success_pairs]
+                worker_count = self._get_worker_count(len(words))
+
+                async def worker() -> None:
+                    while True:
+                        ready_at, idx = await queue.get()
+                        try:
+                            if idx is None:
+                                return
+                            now = time_module.time()
+                            if ready_at > now:
+                                await asyncio.sleep(ready_at - now)
+
+                            word = words[idx]
+                            task_id = task_ids[idx]
+                            retry = attempts[idx] > 0
+
+                            err = await self.context_translate(word, words, retry, task_id=task_id)
+                            if err is None:
+                                success.append(word)
+                                tracker.complete_task(task_id, success=True)
+                                continue
+
+                            tracker.complete_task(task_id, success=False, error=str(err))
+                            attempts[idx] += 1
+
+                            if attempts[idx] <= LLM.MAX_RETRY:
+                                tracker.reopen_task(task_id)
+                                delay = self._compute_retry_delay_seconds(err, attempts[idx])
+                                queue.put_nowait((time_module.time() + delay, idx))
+                            else:
+                                failure.append(word)
+                        finally:
+                            queue.task_done()
+
+                workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+                await queue.join()
+                for _ in range(worker_count):
+                    queue.put_nowait((0.0, None))
+                await asyncio.gather(*workers)
             finally:
                 # 清除全局 tracker
                 set_current_tracker(None)
@@ -1710,7 +2601,7 @@ class LLM:
         import time as time_module
         start_time = time_module.time()
         
-        async with self.semaphore, self.async_limiter:
+        if True:
             error = None
             llm_request = {}
             llm_response = {}

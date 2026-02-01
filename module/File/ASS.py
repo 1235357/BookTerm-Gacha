@@ -1,3 +1,5 @@
+from module.File.TextIO import read_text_lines_any_encoding
+
 class ASS():
 
     # [Script Info]
@@ -24,26 +26,19 @@ class ASS():
     def read_from_path(self, abs_paths: list[str]) -> list[str]:
         items: list[str] = []
         for abs_path in set(abs_paths):
-            # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                lines = [line.strip() for line in reader.readlines()]
+            lines = [line.strip() for line in read_text_lines_any_encoding(abs_path)]
 
-                # 格式字段的数量
-                in_event = False
-                format_field_num = -1
-                for line in lines:
-                    # 判断是否进入事件块
-                    if line == "[Events]":
-                        in_event = True
-                    # 在事件块中寻找格式字段
-                    if in_event == True and line.startswith("Format:"):
-                        format_field_num = len(line.split(",")) - 1
-                        break
+            in_event = False
+            format_field_num = -1
+            for line in lines:
+                if line == "[Events]":
+                    in_event = True
+                if in_event == True and line.startswith("Format:"):
+                    format_field_num = len(line.split(",")) - 1
+                    break
 
-                for line in lines:
-                    content = ",".join(line.split(",")[format_field_num:]) if line.startswith("Dialogue:") else ""
-
-                    # 添加数据
-                    items.append(content.replace("\\N", "\n"))
+            for line in lines:
+                content = ",".join(line.split(",")[format_field_num:]) if line.startswith("Dialogue:") else ""
+                items.append(content.replace("\\N", "\n"))
 
         return items

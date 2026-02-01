@@ -1,4 +1,5 @@
 import json
+from module.File.TextIO import read_text_lines_any_encoding
 
 class KVJSON():
 
@@ -16,23 +17,20 @@ class KVJSON():
         items: list[str] = []
         for abs_path in set(abs_paths):
             # 数据处理
-            with open(abs_path, "r", encoding = "utf-8-sig") as reader:
-                json_data: dict[str, str] = json.load(reader)
+            json_data: dict[str, str] = json.loads("\n".join(read_text_lines_any_encoding(abs_path)))
 
-                # 格式校验
-                if not isinstance(json_data, dict):
-                    continue
+            if not isinstance(json_data, dict):
+                continue
 
-                # 读取数据
-                for k, v in json_data.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        src = k
-                        dst = v
-                        if src == "":
-                            items.append(src)
-                        elif dst != "" and src != dst:
-                            items.append(src)
-                        else:
-                            items.append(src)
+            for k, v in json_data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    src = k
+                    dst = v
+                    if src == "":
+                        items.append(src)
+                    elif dst != "" and src != dst:
+                        items.append(src)
+                    else:
+                        items.append(src)
 
         return items

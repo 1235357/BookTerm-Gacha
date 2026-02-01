@@ -6,7 +6,7 @@
             "name": "智谱GLM-4.6v-flash(免费)",
             "api_url": "https://open.bigmodel.cn/api/paas/v4",
             "api_key": [
-
+                "0ba3bb125f7146ac91f493292407520a.CPFDDWv5ci6ipSy1"
             ],
             "model": "glm-4.6v-flash",
             "thinking": true,
@@ -20,23 +20,27 @@
             "id": 1,
             "name": "NVIDIA-DeepSeek-V3.2",
             "api_url": "https://integrate.api.nvidia.com/v1",
-            "api_key": [
-
-            ],
+            "api_key": [],
+            "api_key_file": "secrets/nvidia_api_keys.txt",
+            "api_key_env": "NVIDIA_API_KEYS",
             "model": "deepseek-ai/deepseek-v3.2",
             "thinking": true,
             "top_p": 0.95,
             "temperature": 0.95,
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
-            "description": "NVIDIA Build DeepSeek V3.2，17个API Key轮询"
+            "description": "NVIDIA Build DeepSeek V3.2，API Key 从文件/环境变量加载"
         },
         {
             "id": 2,
             "name": "魔塔-DeepSeek-V3.2",
             "api_url": "https://api-inference.modelscope.cn/v1/",
             "api_key": [
-
+                "ms-3fb9d58c-ce17-4bc4-ac49-0697b29ba7bf",
+                "ms-cb0c3a6c-1fe6-4517-9434-9a53724d5d3f",
+                "ms-f5c2dc04-e3be-41cf-bd4d-ed4142f157a6",
+                "ms-916aaaa1-67f5-441b-b97b-a4a5fafe087b",
+                "ms-648c63a4-106b-4ba1-a4f2-6942b6bd0e2e"
             ],
             "model": "deepseek-ai/DeepSeek-V3.2",
             "thinking": true,
@@ -51,7 +55,8 @@
             "name": "魔塔-DeepSeek-R1-0528",
             "api_url": "https://api-inference.modelscope.cn/v1/",
             "api_key": [
-
+                "ms-3fb9d58c-ce17-4bc4-ac49-0697b29ba7bf",
+                "ms-cb0c3a6c-1fe6-4517-9434-9a53724d5d3f"
             ],
             "model": "deepseek-ai/DeepSeek-R1-0528",
             "thinking": true,
@@ -70,24 +75,124 @@
         1800,
         "网络请求超时时间，如果频繁出现 timeout 字样的网络错误，可以调大这个值。"
     ],
+    "error_detail_log_enable": [
+        true,
+        "是否启用 error_detail.log（记录任务失败的完整上下文，便于排查解析/校验/网络问题）。"
+    ],
+    "error_detail_log_max_chars": [
+        20000,
+        "error_detail.log 单字段最大字符数（超出会截断）。"
+    ],
+    "error_detail_log_file": [
+        "log/error_detail.log",
+        "error_detail.log 输出路径（相对路径基于项目根目录）。"
+    ],
+    "ipc_enable": [
+        true,
+        "是否启动本地 IPC 服务（用于 GUI/TUI 强一致同步与热更新）。"
+    ],
+    "ipc_host": [
+        "127.0.0.1",
+        "IPC 监听地址（建议保持 127.0.0.1，仅本机可访问）。"
+    ],
+    "ipc_port": [
+        8765,
+        "IPC 监听端口。"
+    ],
+    "api_key_blacklist_ttl_seconds": [
+        3600,
+        "API Key 加入黑名单后的冷却时间（秒）。到期后 Key 会自动恢复可用（适合临时风控/临时封禁场景）。"
+    ],
+    "task_retry_backoff_base_seconds": [
+        2,
+        "任务失败后的重试退避基准秒数（指数退避的起点）。"
+    ],
+    "task_retry_backoff_max_seconds": [
+        120,
+        "任务失败重试退避的最大等待秒数（防止重试风暴）。"
+    ],
+    "task_retry_backoff_rate_limit_seconds": [
+        15,
+        "遇到 429/RateLimit 时的退避基准秒数（通常需要更保守）。"
+    ],
+    "task_retry_backoff_timeout_seconds": [
+        8,
+        "遇到超时/卡流/连接抖动时的退避基准秒数。"
+    ],
+    "task_retry_jitter_ratio": [
+        0.15,
+        "重试退避抖动比例（0-1），用于打散并发重试，默认 0.15。"
+    ],
+    "stream_first_chunk_timeout_seconds": [
+        1200,
+        "流式请求首个 chunk 超时（秒）。默认 600s：从“发”到“思/收”的首包等待。",
+        "超过此时间仍无任何数据，视为服务压力过大：将触发上下文限缩 + 滚动重试（所有阶段生效）。"
+    ],
+    "stream_stall_timeout_seconds": [
+        120,
+        "流式请求卡住超时（秒）。已经收到过 chunk，但超过此时间仍无新数据会判定卡住并中断。",
+        "用于避免长时间无输出导致整批任务堆积。"
+    ],
+    "stream_retry_attempts": [
+        3,
+        "流式请求动态重试次数（包含首次尝试）。建议 2-5。",
+        "遇到卡流/超时/部分 5xx/429 等可恢复错误会自动重试。"
+    ],
+    "stream_retry_backoff_seconds": [
+        2,
+        "流式请求重试退避基准秒数。实际等待 = 基准 × 第N次重试（线性退避）。"
+    ],
+    "llamacpp_auto_detect_enable": [
+        true,
+        "是否自动检测 llama.cpp(/slots) 并自动设置 request_frequency_threshold。"
+    ],
+    "request_frequency_auto_downgrade_enable": [
+        false,
+        "是否启用高频请求自动降级（避免触发 429）。建议默认关闭，完全由手动配置控制。"
+    ],
+    "request_frequency_auto_downgrade_threshold": [
+        20,
+        "当 request_frequency_threshold 超过此值时，触发自动降级（仅在 enable=true 时生效）。"
+    ],
+    "request_frequency_auto_downgrade_to": [
+        10,
+        "自动降级后的 request_frequency_threshold 目标值（仅在 enable=true 时生效）。"
+    ],
     "request_frequency_threshold": [
-        6,
+        1,
         "网络请求频率阈值，单位为 次/秒，值可以小于 1，如果频繁出现 429 代码的网络错误，可以调小这个值。",
         "使用 llama.cpp 运行的本地模型时，将根据 llama.cpp 的配置调整自动设置，无需手动调整这个值。",
         "使用多API轮询时建议设为 5-10，充分利用并发能力。"
     ],
+    "multi_key_default_enable": [
+        true,
+        "多 API Key 平台启用 default 策略：每个 Key 每分钟新增 1 个请求，并发不设上限（仅靠 RPM 控速）。",
+        "如需回退到旧的 次/秒 配置模型，请将此项设为 false。"
+    ],
+    "multi_key_default_per_key_rpm": [
+        1,
+        "default 策略下：每个 API Key 每分钟允许新增的请求数（可为小数）。"
+    ],
+    "unlimited_concurrency_threshold": [
+        65536,
+        "当 max_concurrent_requests <= 0 时，视为不设并发上限，并使用该阈值作为内部并发槽位。"
+    ],
+    "unlimited_worker_count_cap": [
+        1000,
+        "当 max_concurrent_requests <= 0 时，批处理调度启动的 worker 上限（避免创建过多协程）。"
+    ],
     "max_concurrent_requests": [
-        600,
+        0,
         "最大并发请求数，同时进行的请求数量上限。",
         "使用多API轮询时可以适当增加（如 5-10），充分利用多Key并发。",
-        "此值与 request_frequency_threshold 共同控制并发：并发数 = min(max_concurrent_requests, request_frequency_threshold)。"
+        "当此值 <= 0 时表示不设并发上限（推荐与 multi_key_default_enable 搭配使用）。"
     ],
     "traditional_chinese_enable": [
         false,
         "是否启用繁体中文输出，启用后所有中文输出将转换为繁体中文。"
     ],
     "score_threshold": [
-        0.60,
+        0.6,
         "置信度阈值，NER 识别置信度低于此值的词语会被过滤掉。",
         "建议范围 0.50-0.70，值越低识别的词语越多但准确率可能下降。"
     ],
@@ -97,7 +202,7 @@
         "用于过滤异常的超长术语。"
     ],
     "max_context_samples": [
-        5,
+        10,
         "上下文采样数量，从同一词语出现的不同位置采样多少条上下文。",
         "值越大提供的语境越丰富，但会增加 token 消耗。建议 5-15。"
     ],
@@ -107,16 +212,60 @@
         "用于控制单条上下文的长度，建议 256-1024。"
     ],
     "ner_target_types": [
-        ["PER", "LOC"],
+        [
+            "PER",
+            "LOC"
+        ],
         "NER 阶段保留的实体类型列表。",
         "可选值：PER(人名)、LOC(地点)、ORG(组织)、PRD(产品/作品)。",
         "默认只保留 PER 和 LOC，可大幅减少后续 LLM 调用次数。",
         "如需保留全部类型，设为 [\"PER\", \"LOC\", \"ORG\", \"PRD\"]。"
     ],
     "task_timeout_threshold": [
-        600,
+        1200,
         "单任务超时阈值（秒），超过此时间将触发上下文限缩策略。",
         "当某个词条处理时间过长时，会自动减少参考上下文数量并重试。",
         "建议范围 300-600 秒，默认 430 秒。"
-    ]
+    ],
+    "theme": "DARK",
+    "app_language": "ZH",
+    "source_language": "JA",
+    "target_language": "ZH",
+    "input_folder": "./input",
+    "output_folder": "./output",
+    "output_folder_open_on_finish": false,
+    "simplified_chinese_enable": false,
+    "input_token_threshold": 16384,
+    "output_token_threshold": 65536,
+    "max_workers": 0,
+    "rpm_threshold": 0,
+    "max_workers_default_enable": true,
+    "rpm_threshold_default_enable": true,
+    "request_max_retries": 1,
+    "max_round": 16,
+    "expert_mode": false,
+    "proxy_url": "",
+    "proxy_enable": false,
+    "font_hinting": true,
+    "scale_factor": "",
+    "preceding_lines_threshold": 30,
+    "enable_preceding_on_local": false,
+    "clean_ruby": false,
+    "deduplication_in_trans": false,
+    "deduplication_in_bilingual": false,
+    "write_translated_name_fields_to_file": false,
+    "auto_process_prefix_suffix_preserved_text": false,
+    "result_checker_retry_count_threshold": false,
+    "quality_review_enable": false,
+    "quality_review_context_lines": 30,
+    "quality_review_rework_max_retries": 1,
+    "quality_review_hard_fail_max_retries": 1,
+    "timeout_split_on_stream_retry_enable": true,
+    "preceding_only_first_round": false,
+    "exponential_split_across_round_enable": true,
+    "rolling_split_retry_enable": false,
+    "rolling_split_max_depth": 3,
+    "rolling_split_min_input_token_threshold": 0,
+    "rolling_split_halve_preceding_threshold": false,
+    "rolling_split_right_preceding_mode": "tail_context"
 }

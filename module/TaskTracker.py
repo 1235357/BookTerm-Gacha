@@ -37,13 +37,22 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 from rich.console import Console, Group
-from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn, SpinnerColumn
+from rich.progress import (
+    Progress,
+    ProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TaskProgressColumn,
+    SpinnerColumn,
+)
 
 from module.LogTable import LogTable
 
 
 # ==================== 日志抑制控制 ====================
 _suppress_logging: bool = False
+_gui_hook: Optional[callable] = None
 
 
 def is_logging_suppressed() -> bool:
@@ -55,6 +64,11 @@ def set_logging_suppressed(value: bool) -> None:
     """设置日志抑制状态"""
     global _suppress_logging
     _suppress_logging = value
+
+
+def set_gui_hook(hook: Optional[callable]) -> None:
+    global _gui_hook
+    _gui_hook = hook
 
 
 class TaskStatus(Enum):
@@ -82,6 +96,52 @@ class TaskState:
     retry_count: int = 0
 
 
+class PhaseBarColumn(ProgressColumn):
+    def __init__(self, tracker: "TaskTracker", bar_width: int = 40):
+        super().__init__()
+        self.tracker = tracker
+        self.bar_width = int(bar_width or 0) if isinstance(bar_width, int) else 40
+        if self.bar_width <= 0:
+            self.bar_width = 40
+
+    def render(self, task) -> Text:
+        width = self.bar_width
+        with self.tracker._lock:
+            t_total = int(getattr(self.tracker, "translate_total", 0) or 0)
+            r_expected = int(getattr(self.tracker, "review_expected_total", 0) or 0)
+            t_done = int(getattr(self.tracker, "translate_completed", 0) or 0)
+            r_done = int(getattr(self.tracker, "review_completed", 0) or 0)
+
+        if t_total > 0:
+            r_total = min(r_expected, max(0, t_done))
+        else:
+            r_total = r_expected
+
+        total = max(1, int(t_total) + int(r_total))
+        left = int(round(width * (int(t_total) / total))) if total > 0 else 0
+        left = max(0, min(width, left))
+        right = max(0, width - left)
+
+        t_ratio = max(0.0, min(1.0, t_done / max(1, t_total))) if t_total > 0 else 0.0
+        r_ratio = max(0.0, min(1.0, r_done / max(1, r_total))) if r_total > 0 else 0.0
+
+        t_filled = int(round(left * t_ratio))
+        r_filled = int(round(right * r_ratio))
+
+        bar = Text()
+        if left > 0:
+            if t_filled > 0:
+                bar.append("━" * t_filled, style="cyan")
+            if left - t_filled > 0:
+                bar.append("─" * (left - t_filled), style="grey37")
+        if right > 0:
+            if r_filled > 0:
+                bar.append("━" * r_filled, style="magenta")
+            if right - r_filled > 0:
+                bar.append("─" * (right - r_filled), style="grey37")
+        return bar
+
+
 class TaskTracker:
     """
     全局任务追踪器
@@ -97,10 +157,18 @@ class TaskTracker:
         total: int,
         task_name: str = "任务",
         max_concurrent: int = 5,
+        translate_total: int = 0,
+        review_total: int = 0,
     ):
         self.total = total
         self.task_name = task_name
         self.max_concurrent = max_concurrent
+
+        self.translate_total = int(translate_total or 0)
+        self.review_expected_total = int(review_total or 0)
+        self.translate_completed = 0
+        self.review_completed = 0
+        self._stable_phase: Dict[str, int] = {}
         
         # 核心计数
         self.success_count = 0
@@ -114,6 +182,7 @@ class TaskTracker:
         # 响应时间统计
         self._response_times: List[float] = []
         self._failed_reasons: Dict[str, int] = defaultdict(int)
+        self._finalized_task_ids: set[str] = set()
         
         # 时间追踪
         self.start_time = time.time()
@@ -127,7 +196,7 @@ class TaskTracker:
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40),
+            PhaseBarColumn(self, bar_width=40),
             TaskProgressColumn(),
             TextColumn("•"),
             TimeElapsedColumn(),
@@ -137,6 +206,37 @@ class TaskTracker:
             expand=False,
         )
         self._progress_task = None
+
+    def _get_stable_task_id(self, task_id: str) -> str:
+        tid = str(task_id or "")
+        if "." in tid:
+            return tid.split(".", 1)[0]
+        return tid
+
+    def mark_translated(self, task_id: str) -> None:
+        stable = self._get_stable_task_id(task_id)
+        with self._lock:
+            stage = int(self._stable_phase.get(stable, 0) or 0)
+            if stage >= 1:
+                return
+            self._stable_phase[stable] = 1
+            if self.translate_total > 0:
+                self.translate_completed = min(self.translate_total, self.translate_completed + 1)
+        self._refresh()
+
+    def mark_reviewed(self, task_id: str) -> None:
+        stable = self._get_stable_task_id(task_id)
+        with self._lock:
+            stage = int(self._stable_phase.get(stable, 0) or 0)
+            if stage >= 2:
+                return
+            if self.translate_total > 0 and stage < 1:
+                self._stable_phase[stable] = 1
+                self.translate_completed = min(self.translate_total, self.translate_completed + 1)
+            self._stable_phase[stable] = 2
+            if self.review_expected_total > 0:
+                self.review_completed = min(self.review_expected_total, self.review_completed + 1)
+        self._refresh()
     
     def __enter__(self):
         """进入上下文：启动 Live 显示"""
@@ -214,7 +314,7 @@ class TaskTracker:
         )
         
         # 计算待处理数
-        pending_count = self.total - self.success_count
+        pending_count = max(0, self.total - self.success_count)
         
         # 计算平均响应时间
         avg_time = 0.0
@@ -245,7 +345,8 @@ class TaskTracker:
         
         # 2. 进度部分
         line_info.append("📈 ", style="bold")
-        line_info.append(f"{self.success_count}/{self.total}", style="bold green")
+        display_success = min(self.success_count, self.total)
+        line_info.append(f"{display_success}/{self.total}", style="bold green")
         
         prog_details = []
         if pending_count > 0:
@@ -257,6 +358,18 @@ class TaskTracker:
             
         if prog_details:
             line_info.append(f" ({' '.join(prog_details)})", style="dim")
+
+        if self.translate_total > 0 or self.review_expected_total > 0:
+            with self._lock:
+                t_total = int(self.translate_total or 0)
+                r_expected = int(self.review_expected_total or 0)
+                t_done = int(self.translate_completed or 0)
+                r_done = int(self.review_completed or 0)
+            if t_total > 0:
+                line_info.append(" │ ", style="dim")
+                line_info.append(f"译:{min(t_done, t_total)}/{t_total}", style="cyan")
+                line_info.append(" ", style="dim")
+                line_info.append(f"校:{min(r_done, r_expected)}/{r_expected}", style="magenta")
             
         line_info.append(" │ ", style="dim")
         
@@ -330,7 +443,18 @@ class TaskTracker:
     def complete_task(self, task_id: str, success: bool = True, error: Optional[str] = None) -> None:
         """完成一个任务"""
         with self._lock:
+            if task_id in self._finalized_task_ids:
+                return
+
             task = self._tasks.get(task_id)
+            if task is None:
+                task = TaskState(
+                    task_id=task_id,
+                    status=TaskStatus.WAITING,
+                    start_time=time.time(),
+                )
+                self._tasks[task_id] = task
+
             elapsed = 0
             if task:
                 task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
@@ -342,16 +466,38 @@ class TaskTracker:
                 self.success_count += 1
                 if elapsed > 0:
                     self._response_times.append(elapsed)
+                if self.review_expected_total > 0:
+                    stable = self._get_stable_task_id(task_id)
+                    stage = int(self._stable_phase.get(stable, 0) or 0)
+                    if stage < 2:
+                        if self.translate_total > 0 and stage < 1:
+                            self._stable_phase[stable] = 1
+                            self.translate_completed = min(self.translate_total, self.translate_completed + 1)
+                        self._stable_phase[stable] = 2
+                        self.review_completed = min(self.review_expected_total, self.review_completed + 1)
+                elif self.translate_total > 0:
+                    stable = self._get_stable_task_id(task_id)
+                    stage = int(self._stable_phase.get(stable, 0) or 0)
+                    if stage < 1:
+                        self._stable_phase[stable] = 1
+                        self.translate_completed = min(self.translate_total, self.translate_completed + 1)
             else:
                 self.failed_in_round += 1
                 if error:
                     short_error = self._simplify_error(error)
                     self._failed_reasons[short_error] += 1
+
+            self._finalized_task_ids.add(task_id)
         
         # 更新进度条
         if success and self._progress_task is not None:
             self._progress.update(self._progress_task, completed=self.success_count)
         self._refresh()
+
+    def reopen_task(self, task_id: str) -> None:
+        """允许同一 task_id 在失败后被再次执行并再次 complete（用于滚动重试）"""
+        with self._lock:
+            self._finalized_task_ids.discard(task_id)
     
     def _simplify_error(self, error: str) -> str:
         """简化错误信息"""
@@ -359,6 +505,8 @@ class TaskTracker:
         
         if "超时" in error or "timeout" in error.lower():
             return "超时"
+        if "流式响应超时" in error or "stalled" in error.lower():
+            return "流式卡住"
         if "假名残留" in error:
             return "假名残留"
         if "韩文残留" in error:
@@ -367,6 +515,10 @@ class TaskTracker:
             return "模型退化"
         if "翻译失效" in error or "相似度" in error:
             return "翻译失效"
+        if "行数不一致" in error or "行数错误" in error:
+            return "行数错误"
+        if "JSON" in error or "解析失败" in error:
+            return "解析失败"
         if "实体类型" in error:
             return "类型不匹配"
         if "敏感内容" in error or "contentFilter" in error:
@@ -375,6 +527,8 @@ class TaskTracker:
             return "数据结构错误"
         if "429" in error:
             return "并发限制(429)"
+        if "403" in error or "401" in error or "PermissionDenied" in error:
+            return "权限错误"
         if "连接" in error or "connect" in error.lower():
             return "网络连接"
         
@@ -385,6 +539,7 @@ class TaskTracker:
         with self._lock:
             self.retry_round += 1
             self.failed_in_round = 0
+            self._failed_reasons.clear()
             self._tasks = {k: v for k, v in self._tasks.items() 
                           if v.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)}
         self._refresh()
@@ -401,6 +556,26 @@ class TaskTracker:
     
     def _refresh(self) -> None:
         """刷新显示"""
+        hook = _gui_hook
+        if callable(hook):
+            try:
+                with self._lock:
+                    snapshot = {
+                        "task_name": self.task_name,
+                        "total": int(self.total or 0),
+                        "max_concurrent": int(self.max_concurrent or 0),
+                        "translate_total": int(getattr(self, "translate_total", 0) or 0),
+                        "review_total": int(getattr(self, "review_expected_total", 0) or 0),
+                        "translate_completed": int(getattr(self, "translate_completed", 0) or 0),
+                        "review_completed": int(getattr(self, "review_completed", 0) or 0),
+                        "success": int(getattr(self, "success_count", 0) or 0),
+                        "failed_in_round": int(getattr(self, "failed_in_round", 0) or 0),
+                        "retry_round": int(getattr(self, "retry_round", 0) or 0),
+                        "elapsed_seconds": max(0.0, float(time.time() - float(getattr(self, "start_time", time.time()) or time.time()))),
+                    }
+                hook(snapshot)
+            except Exception:
+                pass
         if self._live:
             self._live.update(self._build_panel())
     

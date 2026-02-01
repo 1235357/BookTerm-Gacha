@@ -35,7 +35,11 @@ import copy
 import json
 import asyncio
 import subprocess
+import re
 from types import SimpleNamespace
+import argparse
+import threading
+import time
 
 # ============== Windows 控制台 UTF-8 编码设置（必须在最开始） ==============
 if sys.platform == 'win32':
@@ -126,6 +130,53 @@ from module.ProgressHelper import ProgressHelper
 from module.TestHelper import TestHelper
 from module.FileManager import FileManager
 from module.Text.TextHelper import TextHelper
+
+
+def _resolve_platform_api_keys(platform: dict) -> list[str]:
+    keys: list[str] = []
+
+    env_name = platform.get("api_key_env", "") if isinstance(platform, dict) else ""
+    if isinstance(env_name, str) and env_name.strip():
+        env_val = os.environ.get(env_name.strip(), "") or ""
+        for part in re.split(r"[,\n;]+", env_val):
+            m = re.search(r"(nvapi-[A-Za-z0-9_\-]{20,})", part.strip())
+            if m:
+                keys.append(m.group(1))
+
+    file_path = platform.get("api_key_file", "") if isinstance(platform, dict) else ""
+    if isinstance(file_path, str) and file_path.strip():
+        abs_path = file_path.strip()
+        if not os.path.isabs(abs_path):
+            abs_path = os.path.join(os.getcwd(), abs_path)
+        try:
+            with open(abs_path, "r", encoding="utf-8-sig") as reader:
+                for line in reader.read().splitlines():
+                    m = re.search(r"(nvapi-[A-Za-z0-9_\-]{20,})", line.strip())
+                    if m:
+                        keys.append(m.group(1))
+        except Exception:
+            pass
+
+    api_key_value = platform.get("api_key", []) if isinstance(platform, dict) else []
+    if isinstance(api_key_value, str):
+        m = re.search(r"(nvapi-[A-Za-z0-9_\-]{20,})", api_key_value.strip())
+        if m:
+            keys.append(m.group(1))
+    elif isinstance(api_key_value, list):
+        for item in api_key_value:
+            if not isinstance(item, str):
+                continue
+            m = re.search(r"(nvapi-[A-Za-z0-9_\-]{20,})", item.strip())
+            if m:
+                keys.append(m.group(1))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            deduped.append(k)
+    return deduped
 
 
 # ============== 配置常量（默认值，会被 config.json 覆盖） ==============
@@ -256,17 +307,9 @@ async def process_text(llm: LLM, ner: NER, file_manager: FileManager, config: Si
     llm.set_language(language)
     llm.set_request_limiter()
 
-    # ============== 新工作流程：先翻译参考文本，再进行词义分析 ==============
-    # 核心思路：让 LLM 在翻译过程中充分理解上下文，然后基于翻译结果进行校对审查
-    
-    # 步骤1：参考文本翻译（非中文时执行，让 LLM 理解上下文）
-    if language != NER.Language.ZH:
-        LogHelper.info("即将开始执行 [参考文本翻译]（第一阶段：翻译上下文，理解语境）...")
-        words = await llm.context_translate_batch(words)
-    
-    # 步骤2：词义分析（基于翻译结果进行校对、审查、语义分析，给出最终译名）
-    LogHelper.info("即将开始执行 [词义分析]（第二阶段：校对审查，确定最终译名）...")
-    words = await llm.surface_analysis_batch(words, fake_name_mapping)
+    # ============== 新工作流程：整合为单一任务流（翻译→校对审查）=============
+    LogHelper.info("即将开始执行 [翻译+校对]（同一批任务并行推进，避免阶段切割）...")
+    words = await llm.translate_and_surface_analysis_batch(words, fake_name_mapping)
     words = remove_words_by_type(words, "")
 
     # 步骤3：问题修复（第三阶段：检测并修复问题词条）
@@ -306,7 +349,7 @@ async def process_text(llm: LLM, ner: NER, file_manager: FileManager, config: Si
 # 接口测试
 async def test_api(llm: LLM) -> None:
     # 设置请求限制器
-    llm.set_request_limiter()
+    await llm.set_request_limiter()
 
     # 等待接口测试结果
     if await llm.api_test():
@@ -377,7 +420,7 @@ def print_app_info(config: SimpleNamespace, version: str) -> None:
     LogHelper.print()
 
 # 打印菜单
-def print_menu_main() -> int:
+async def print_menu_main() -> int:
     LogHelper.print("请选择功能：")
     LogHelper.print("")
     LogHelper.print("\t--> 1. 开始处理 [green]中文文本[/]")
@@ -385,13 +428,18 @@ def print_menu_main() -> int:
     LogHelper.print("\t--> 3. 开始处理 [green]日文文本[/]")
     LogHelper.print("\t--> 4. 开始处理 [green]韩文文本[/]")
     LogHelper.print("\t--> 5. 开始执行 [green]接口测试[/]")
+    LogHelper.print("\t--> 6. 打开 [green]配置面板[/]（交互式编辑）")
+    LogHelper.print("\t--> 7. 查看 [green]运行状态面板[/]")
     LogHelper.print("")
-    choice = int(Prompt.ask("请输入选项前的 [green]数字序号[/] 来使用对应的功能，默认为 [green][3][/] ",
-        choices = ["1", "2", "3", "4", "5"],
-        default = "3",
-        show_choices = False,
-        show_default = False
-    ))
+    choice_text = await asyncio.to_thread(
+        Prompt.ask,
+        "请输入选项前的 [green]数字序号[/] 来使用对应的功能，默认为 [green][3][/] ",
+        choices=["1", "2", "3", "4", "5", "6", "7"],
+        default="3",
+        show_choices=False,
+        show_default=False,
+    )
+    choice = int(choice_text)
     LogHelper.print("")
 
     return choice
@@ -402,7 +450,7 @@ async def begin(llm: LLM, ner: NER, file_manager: FileManager, config: SimpleNam
     while choice not in (1, 2, 3, 4):
         print_app_info(config, version)
 
-        choice = print_menu_main()
+        choice = await print_menu_main()
         if choice == 1:
             await process_text(llm, ner, file_manager, config, NER.Language.ZH)
         elif choice == 2:
@@ -413,108 +461,135 @@ async def begin(llm: LLM, ner: NER, file_manager: FileManager, config: SimpleNam
             await process_text(llm, ner, file_manager, config, NER.Language.KO)
         elif choice == 5:
             await test_api(llm)
+        elif choice == 6:
+            from module.ConsolePanels import interactive_config_edit
+            changed = await asyncio.to_thread(interactive_config_edit)
+            if changed:
+                _hot_reload_config(llm, config)
+        elif choice == 7:
+            from module.ConsolePanels import show_status_live
+            await asyncio.to_thread(show_status_live, llm)
+
+
+def _start_runtime_status_writer(llm: LLM):
+    try:
+        from module.RuntimeStatusStore import RuntimeStatusWriter
+        w = RuntimeStatusWriter(get_status=llm.get_runtime_status, interval_seconds=1.0)
+        w.start()
+        return w
+    except Exception:
+        return None
+
+
+def _update_namespace_in_place(dst: SimpleNamespace, src: SimpleNamespace) -> None:
+    dst.__dict__.clear()
+    dst.__dict__.update(src.__dict__)
+
+
+def _select_config_path() -> str:
+    if not os.path.isfile("config_dev.json"):
+        return "config.json"
+    return "config_dev.json"
+
+
+def _load_config_namespace() -> tuple[SimpleNamespace, str]:
+    config = SimpleNamespace()
+    version = ""
+    raw_config = {}
+    path = _select_config_path()
+
+    try:
+        with open(path, "r", encoding="utf-8-sig") as reader:
+            raw_config = json.load(reader)
+
+        if "platforms" in raw_config and "activate_platform" in raw_config:
+            platforms = raw_config.get("platforms", [])
+            activate_id = raw_config.get("activate_platform", 0)
+
+            active_platform = None
+            for platform in platforms:
+                if platform.get("id") == activate_id:
+                    active_platform = platform
+                    break
+
+            if active_platform is None and platforms:
+                active_platform = platforms[0]
+                LogHelper.warning(f"[配置警告] 未找到 ID={activate_id} 的平台，使用默认平台: {active_platform.get('name', 'Unknown')}")
+
+            if active_platform:
+                config.api_key = _resolve_platform_api_keys(active_platform)
+                config.base_url = active_platform.get("api_url", "")
+                config.model_name = active_platform.get("model", "")
+                config.platform_name = active_platform.get("name", "Unknown")
+                config.thinking = active_platform.get("thinking", True)
+                config.top_p = active_platform.get("top_p", 0.95)
+                config.temperature = active_platform.get("temperature", 0.05)
+
+            for k, v in raw_config.items():
+                if k not in ("platforms", "activate_platform"):
+                    if isinstance(v, list) and len(v) > 0 and not k.startswith("api"):
+                        setattr(config, k, v[0])
+                    elif not isinstance(v, list):
+                        setattr(config, k, v)
+        else:
+            for k, v in raw_config.items():
+                setattr(config, k, v[0] if isinstance(v, list) else v)
+
+        with open("version.txt", "r", encoding="utf-8-sig") as reader:
+            version = reader.read().strip()
+    except Exception as e:
+        LogHelper.error(f"配置文件读取失败: {e}")
+
+    return config, version
+
+
+def _apply_global_settings(config: SimpleNamespace) -> None:
+    global SCORE_THRESHOLD, MAX_DISPLAY_LENGTH
+    SCORE_THRESHOLD = getattr(config, "score_threshold", 0.60)
+    MAX_DISPLAY_LENGTH = getattr(config, "max_display_length", 32)
+    Word.set_config(
+        max_context_samples=getattr(config, "max_context_samples", 10),
+        tokens_per_sample=getattr(config, "tokens_per_sample", 512),
+    )
+    task_timeout = getattr(config, "task_timeout_threshold", 430)
+    LLM.TASK_TIMEOUT_THRESHOLD = task_timeout
+
+    try:
+        from module.ErrorLogger import ErrorLogger
+
+        ErrorLogger.configure(
+            enabled=getattr(config, "error_detail_log_enable", True),
+            max_chars=getattr(config, "error_detail_log_max_chars", 20000),
+            log_file=getattr(config, "error_detail_log_file", "log/error_detail.log"),
+        )
+    except Exception:
+        pass
+
+
+def _hot_reload_config(llm: LLM, config_obj: SimpleNamespace) -> None:
+    new_config, _ = _load_config_namespace()
+    old_keys = list(getattr(llm, "api_keys", []) or [])
+    old_url = getattr(llm, "base_url", "")
+    old_model = getattr(llm, "model_name", "")
+    new_keys = list(getattr(new_config, "api_key", []) or []) if isinstance(getattr(new_config, "api_key", []), list) else []
+    if old_url != getattr(new_config, "base_url", "") or old_model != getattr(new_config, "model_name", "") or old_keys != new_keys:
+        LLM.reset_api_state()
+    _apply_global_settings(new_config)
+    _update_namespace_in_place(config_obj, new_config)
+    llm.apply_runtime_config(config_obj)
 
 # 一些初始化步骤
 def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
-    global SCORE_THRESHOLD, MAX_DISPLAY_LENGTH
-    
     with LogHelper.status("正在初始化 [green] BookTerm Gacha [/] 引擎 ..."):
-        config = SimpleNamespace()
-        version = ""
-        raw_config = {}
-
-        try:
-            # 优先使用开发环境配置文件
-            if not os.path.isfile("config_dev.json"):
-                path = "config.json"
-            else:
-                path = "config_dev.json"
-
-            # 读取配置文件
-            with open(path, "r", encoding = "utf-8-sig") as reader:
-                raw_config = json.load(reader)
-
-            # ============== 新配置格式：多平台支持 ==============
-            if "platforms" in raw_config and "activate_platform" in raw_config:
-                # 新格式：多平台配置
-                platforms = raw_config.get("platforms", [])
-                activate_id = raw_config.get("activate_platform", 0)
-                
-                # 找到激活的平台配置
-                active_platform = None
-                for platform in platforms:
-                    if platform.get("id") == activate_id:
-                        active_platform = platform
-                        break
-                
-                if active_platform is None and platforms:
-                    active_platform = platforms[0]  # 默认使用第一个
-                    LogHelper.warning(f"[配置警告] 未找到 ID={activate_id} 的平台，使用默认平台: {active_platform.get('name', 'Unknown')}")
-                
-                if active_platform:
-                    # 从平台配置提取 API 设置
-                    config.api_key = active_platform.get("api_key", [])
-                    config.base_url = active_platform.get("api_url", "")
-                    config.model_name = active_platform.get("model", "")
-                    config.platform_name = active_platform.get("name", "Unknown")
-                    config.thinking = active_platform.get("thinking", True)
-                    config.top_p = active_platform.get("top_p", 0.95)
-                    config.temperature = active_platform.get("temperature", 0.05)
-                    
-                    LogHelper.info(f"[多平台配置] 已加载平台: [bold cyan]{config.platform_name}[/]")
-                    api_keys = config.api_key
-                    if isinstance(api_keys, list) and len(api_keys) > 1:
-                        LogHelper.info(f"[多API轮询] 检测到 {len(api_keys)} 个 API Key，已启用轮询模式")
-                
-                # 加载其他配置项（使用 [value, description] 格式）
-                for k, v in raw_config.items():
-                    if k not in ("platforms", "activate_platform"):
-                        if isinstance(v, list) and len(v) > 0 and not k.startswith("api"):
-                            setattr(config, k, v[0])  # 取第一个元素作为值
-                        elif not isinstance(v, list):
-                            setattr(config, k, v)
-            else:
-                # ============== 旧配置格式：向后兼容 ==============
-                for k, v in raw_config.items():
-                    setattr(config, k, v[0] if isinstance(v, list) else v)
-
-            # 读取版本号文件
-            with open("version.txt", "r", encoding = "utf-8-sig") as reader:
-                version = reader.read().strip()
-        except Exception as e:
-            LogHelper.error(f"配置文件读取失败: {e}")
-
-        # ============== 从配置加载全局参数 ==============
-        # 置信度阈值
-        SCORE_THRESHOLD = getattr(config, 'score_threshold', 0.60)
-        # 术语最大显示长度
-        MAX_DISPLAY_LENGTH = getattr(config, 'max_display_length', 32)
-        # Word 类的上下文采样配置
-        Word.set_config(
-            max_context_samples=getattr(config, 'max_context_samples', 10),
-            tokens_per_sample=getattr(config, 'tokens_per_sample', 512)
-        )
-        # LLM 类的超时阈值配置
-        task_timeout = getattr(config, 'task_timeout_threshold', 430)
-        LLM.TASK_TIMEOUT_THRESHOLD = task_timeout
-        
-        # 重置 API 状态（每次启动时清除黑名单和轮询索引）
+        config, version = _load_config_namespace()
+        _apply_global_settings(config)
         LLM.reset_api_state()
-
-        try:
-            from module.ErrorLogger import ErrorLogger
-            ErrorLogger.configure(
-                enabled=getattr(config, "error_detail_log_enable", True),
-                max_chars=getattr(config, "error_detail_log_max_chars", 20000),
-                log_file=getattr(config, "error_detail_log_file", "log/error_detail.log"),
-            )
-        except Exception:
-            pass
 
         # 初始化 LLM 对象
         llm = LLM(config)
         llm.load_prompt()
         llm.load_llm_config()
+        llm.set_request_limiter()
 
         # 初始化 NER 对象
         ner = NER()
@@ -544,11 +619,80 @@ def load_config() -> tuple[LLM, NER, FileManager, SimpleNamespace, str]:
 # 确保程序出错时可以捕捉到错误日志
 async def main() -> None:
     try:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--no-status-writer", action="store_true")
+        parser.add_argument("--no-ipc", action="store_true")
+        args, _ = parser.parse_known_args()
+
         # 注册全局异常追踪器
         install()
 
         # 加载配置
         llm, ner, file_manager, config, version = load_config()
+        writer = None if args.no_status_writer else _start_runtime_status_writer(llm)
+
+        ipc_server = None
+        if not args.no_ipc and bool(getattr(config, "ipc_enable", True)):
+            from module.IpcServer import IpcServer
+            from module.IpcProtocol import IpcResponse, sanitize_updates
+            from module.ConfigStore import load_raw, save_raw, set_value, get_value, platform_summary
+
+            ipc_lock = threading.Lock()
+
+            def dispatch(method: str, params: dict, req_id: str) -> IpcResponse:
+                rid = str(req_id or "req")
+                try:
+                    with ipc_lock:
+                        if method == "get_status":
+                            return IpcResponse(id=rid, ok=True, result=llm.get_runtime_status())
+                        if method == "reload_platform":
+                            _hot_reload_config(llm, config)
+                            return IpcResponse(id=rid, ok=True, result={"status": llm.get_runtime_status()})
+                        if method == "get_config":
+                            path, raw = load_raw()
+                            name, pid, key_count = platform_summary(raw)
+                            result = {
+                                "config_path": path,
+                                "activate_platform": pid,
+                                "platform_name": name,
+                                "platform_key_count": key_count,
+                                "multi_key_default_enable": bool(get_value(raw, "multi_key_default_enable", True)),
+                                "multi_key_default_per_key_rpm": float(get_value(raw, "multi_key_default_per_key_rpm", 1) or 1),
+                                "api_key_blacklist_ttl_seconds": int(get_value(raw, "api_key_blacklist_ttl_seconds", 3600) or 3600),
+                                "max_concurrent_requests": int(get_value(raw, "max_concurrent_requests", 0) or 0),
+                                "request_frequency_threshold": float(get_value(raw, "request_frequency_threshold", 1) or 1),
+                                "ipc_host": str(getattr(config, "ipc_host", "127.0.0.1")),
+                                "ipc_port": int(getattr(config, "ipc_port", 8765)),
+                            }
+                            return IpcResponse(id=rid, ok=True, result=result)
+                        if method == "set_config":
+                            updates = sanitize_updates(params.get("updates"))
+                            path, raw = load_raw()
+                            for k, v in updates.items():
+                                set_value(raw, k, v)
+                            save_raw(path, raw)
+                            _hot_reload_config(llm, config)
+                            return IpcResponse(id=rid, ok=True, result={"status": llm.get_runtime_status()})
+                        return IpcResponse(id=rid, ok=False, error="unknown_method")
+                except Exception as e:
+                    return IpcResponse(id=rid, ok=False, error=str(e))
+
+            host = str(getattr(config, "ipc_host", "127.0.0.1") or "127.0.0.1")
+            port = int(getattr(config, "ipc_port", 8765) or 8765)
+            ipc_server = IpcServer(host=host, port=port, dispatch=dispatch)
+            ipc_server.start()
+
+            def publish_loop() -> None:
+                while True:
+                    try:
+                        with ipc_lock:
+                            data = llm.get_runtime_status()
+                        ipc_server.publish("status", data)
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+
+            threading.Thread(target=publish_loop, daemon=True).start()
 
         # 开始处理
         await begin(llm, ner, file_manager, config, version)

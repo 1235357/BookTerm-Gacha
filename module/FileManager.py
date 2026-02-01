@@ -81,6 +81,7 @@ class FileManager():
     def __init__(self, traditional_chinese_enable: bool = False) -> None:
         super().__init__()
         self.traditional_chinese_enable = traditional_chinese_enable
+        self.input_path = "input"
 
     @classmethod
     def get_opencc_s2t(cls) -> opencc.OpenCC:
