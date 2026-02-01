@@ -28,3 +28,7 @@ tmp.md
 widget/
 frontend/
 tmp/
+
+# 测试和平台配置
+tests/
+resource/platforms/
